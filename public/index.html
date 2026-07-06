@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>XAU 黄金量化终端</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <canvas id="particleCanvas" class="particle-canvas" aria-hidden="true"></canvas>
+  <div class="app-shell">
+    <header class="global-nav">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <strong><span class="brand-xau">XAU</span> <span class="brand-quant">QUANT</span></strong>
+          <span id="runtimeMode">六模块架构</span>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Primary">
+        <button data-page="dashboard" class="active">状态总览</button>
+        <button data-page="signals">信号引擎</button>
+        <button data-page="macro">宏观监控</button>
+        <button data-page="trades">交易中心</button>
+        <button data-page="backtests">回测实验室</button>
+        <button data-page="settings">系统配置</button>
+      </nav>
+      <div class="nav-status">
+        <span id="systemDot" class="status-dot"></span>
+        <span id="healthBadge" class="status-pill">连接中</span>
+        <span class="trade-state">交易 <strong id="tradingState">关闭</strong></span>
+        <time id="clock">--:--:--</time>
+        <button id="refreshButton" class="icon-button" type="button" title="刷新">↻</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="pageEyebrow">状态总览</p>
+          <h1 id="pageTitle">状态总览</h1>
+        </div>
+      </header>
+      <section id="view" class="view" aria-live="polite"></section>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: xau-quant-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xau_quant}
+      POSTGRES_USER: ${POSTGRES_USER:-xau}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xau_quant_change_me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xau} -d ${POSTGRES_DB:-xau_quant}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - advanceok_default
+    restart: unless-stopped
+
+  xau:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${XAU_BASE_IMAGE:-node:22-alpine}
+    image: xau-quant-terminal:latest
+    container_name: xau-quant-terminal
+    environment:
+      NODE_ENV: production
+      PORT: "4899"
+      DATA_DIR: /data
+      TRADING_ENABLED: "false"
+      OKX_API_BASE: ${OKX_API_BASE:-https://www.okx.com}
+      OKX_LIVE_API_BASE: ${OKX_LIVE_API_BASE:-https://www.okx.com}
+      OKX_DEMO_API_BASE: ${OKX_DEMO_API_BASE:-https://demo.okx.com}
+      OKX_INST_ID: ${OKX_INST_ID:-XAU-USDT-SWAP}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_API_SECRET: ${OKX_API_SECRET:-}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE:-}
+      OKX_TRADING_MODE: ${OKX_TRADING_MODE:-demo}
+      OKX_DEMO_TRADING_ENABLED: ${OKX_DEMO_TRADING_ENABLED:-true}
+      OKX_SIMULATED: ${OKX_SIMULATED:-1}
+      OANDA_API_KEY: ${OANDA_API_KEY:-}
+      OANDA_ACCOUNT_ID: ${OANDA_ACCOUNT_ID:-}
+      OANDA_API_BASE: ${OANDA_API_BASE:-https://api-fxtrade.oanda.com}
+      OANDA_INSTRUMENT: ${OANDA_INSTRUMENT:-XAU_USD}
+      OANDA_BACKTEST_CANDLE_COUNT: ${OANDA_BACKTEST_CANDLE_COUNT:-20000}
+      OANDA_BACKTEST_RANGE_DAYS: ${OANDA_BACKTEST_RANGE_DAYS:-730}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-xau}:${POSTGRES_PASSWORD:-xau_quant_change_me}@postgres:5432/${POSTGRES_DB:-xau_quant}}
+    volumes:
+      - ./data:/data
+    expose:
+      - "4899"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4899/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - advanceok_default
+    restart: unless-stopped
+
+networks:
+  advanceok_default:
+    external: true
+
+volumes:
+  pgdata:
