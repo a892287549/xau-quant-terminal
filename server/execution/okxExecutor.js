@@ -20,6 +20,26 @@ function compactId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.slice(0, 32);
 }
 
+function roundLot(value) {
+  return Math.max(0.01, Math.floor(Number(value || 0) * 100) / 100);
+}
+
+function floorLot(value) {
+  return Math.floor(Number(value || 0) * 100) / 100;
+}
+
+function closeSide(direction) {
+  return direction === "LONG" ? "sell" : "buy";
+}
+
+function directionSign(direction) {
+  return direction === "SHORT" ? -1 : 1;
+}
+
+function responseData(payload) {
+  return payload?.data?.[0] || payload?.response || payload || {};
+}
+
 class OkxExecutionError extends Error {
   constructor(message, { status = 400, retryable = false, retryAfterMs = 0, payload = null, reason = "" } = {}) {
     super(message);
@@ -240,6 +260,167 @@ export class OkxExecutor {
       mode: this.tradingMode(settings),
       request: body,
       response: payload.data?.[0] || payload
+    };
+  }
+
+  async closePosition(positionId, { storage, settings = {}, reason = "closed", exitPrice = null } = {}) {
+    if (!storage?.enabled) {
+      throw new OkxExecutionError("Storage is required to close a managed position", { reason: "storage_missing" });
+    }
+    const trade = await storage.getTradeById(positionId);
+    if (!trade) {
+      throw new OkxExecutionError(`Trade ${positionId} was not found`, { reason: "trade_not_found" });
+    }
+    const size = roundLot(trade.size);
+    const order = await this.placePerpetualMarketOrder({
+      instrument: trade.symbol || this.instrument,
+      side: closeSide(trade.direction),
+      size,
+      clientOrderId: compactId("cls")
+    }, settings);
+    const fill = Number(responseData(order).fillPx || responseData(order).avgPx || exitPrice || trade.exit || trade.entry);
+    const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || 100);
+    const pnl = Number.isFinite(fill)
+      ? (fill - Number(trade.entry)) * directionSign(trade.direction) * Number(trade.size || 0) * pnlMultiplier
+      : Number(trade.pnl || 0);
+    const status = reason === "timeout" ? "timeout" : reason === "stop_loss" ? "stopped_out" : "closed";
+    await storage.updateTrade(positionId, {
+      closedAt: new Date().toISOString(),
+      exit: Number.isFinite(fill) ? fill : null,
+      pnl: Number(Number(pnl || 0).toFixed(2)),
+      status,
+      payload: {
+        ...(trade.payload || {}),
+        exitReason: reason,
+        closeOrder: order,
+        events: [
+          ...((trade.payload || {}).events || []),
+          { at: new Date().toISOString(), type: "closed", reason, order }
+        ]
+      }
+    });
+    return {
+      tradeId: positionId,
+      status,
+      sizeClosed: size,
+      remainingSize: 0,
+      order
+    };
+  }
+
+  async closeHalfPosition(positionId, { storage, settings = {} } = {}) {
+    if (!storage?.enabled) {
+      throw new OkxExecutionError("Storage is required to close half a managed position", { reason: "storage_missing" });
+    }
+    const trade = await storage.getTradeById(positionId);
+    if (!trade) {
+      throw new OkxExecutionError(`Trade ${positionId} was not found`, { reason: "trade_not_found" });
+    }
+    const totalSize = Number(trade.size || 0);
+    if (totalSize < 0.02) {
+      throw new OkxExecutionError("Position is too small for partial close", { reason: "partial_size_too_small" });
+    }
+    const size = roundLot(totalSize / 2);
+    const remainingSize = floorLot(totalSize - size);
+    const order = await this.placePerpetualMarketOrder({
+      instrument: trade.symbol || this.instrument,
+      side: closeSide(trade.direction),
+      size,
+      clientOrderId: compactId("ptp")
+    }, settings);
+    await storage.updateTrade(positionId, {
+      size: remainingSize,
+      status: "partial_closed",
+      payload: {
+        ...(trade.payload || {}),
+        partialTpAt: new Date().toISOString(),
+        partialTpOrder: order,
+        originalSize: trade.payload?.originalSize || trade.size,
+        events: [
+          ...((trade.payload || {}).events || []),
+          { at: new Date().toISOString(), type: "partial_tp", sizeClosed: size, remainingSize, order }
+        ]
+      }
+    });
+    return {
+      tradeId: positionId,
+      sizeClosed: size,
+      remainingSize,
+      order
+    };
+  }
+
+  async cancelStopAlgo({ instrument = this.instrument, algoId, settings = {} } = {}) {
+    if (!algoId) return { skipped: true, reason: "missing_algo_id" };
+    const payload = await this.request("/api/v5/trade/cancel-algos", {
+      method: "POST",
+      body: [{ instId: instrument, algoId }],
+      settings
+    });
+    return responseData(payload);
+  }
+
+  async placeStopAlgo({ instrument = this.instrument, direction, size, stopPrice, settings = {} } = {}) {
+    const body = {
+      instId: instrument,
+      tdMode: "cross",
+      side: closeSide(direction),
+      ordType: "conditional",
+      sz: String(roundLot(size)),
+      slTriggerPx: String(stopPrice),
+      slOrdPx: "-1"
+    };
+    const payload = await this.request("/api/v5/trade/order-algo", {
+      method: "POST",
+      body,
+      settings
+    });
+    return {
+      request: body,
+      response: responseData(payload)
+    };
+  }
+
+  async updateTrailingStop(positionId, newStopPrice, { storage, settings = {} } = {}) {
+    if (!storage?.enabled) {
+      throw new OkxExecutionError("Storage is required to update a managed stop", { reason: "storage_missing" });
+    }
+    const trade = await storage.getTradeById(positionId);
+    if (!trade) {
+      throw new OkxExecutionError(`Trade ${positionId} was not found`, { reason: "trade_not_found" });
+    }
+    const oldAlgoId = trade.payload?.stopAlgoId || trade.payload?.actualStopOrderId || trade.payload?.stopOrderId;
+    const cancelResult = await this.cancelStopAlgo({
+      instrument: trade.symbol || this.instrument,
+      algoId: oldAlgoId,
+      settings
+    });
+    const stopOrder = await this.placeStopAlgo({
+      instrument: trade.symbol || this.instrument,
+      direction: trade.direction,
+      size: trade.size,
+      stopPrice: newStopPrice,
+      settings
+    });
+    const nextAlgoId = stopOrder.response?.algoId || stopOrder.response?.ordId || "";
+    await storage.updateTrade(positionId, {
+      payload: {
+        ...(trade.payload || {}),
+        stop: newStopPrice,
+        stopAlgoId: nextAlgoId,
+        trailingStopUpdatedAt: new Date().toISOString(),
+        events: [
+          ...((trade.payload || {}).events || []),
+          { at: new Date().toISOString(), type: "trailing_stop_update", oldAlgoId, newStopPrice, stopOrder, cancelResult }
+        ]
+      }
+    });
+    return {
+      tradeId: positionId,
+      stop: newStopPrice,
+      stopAlgoId: nextAlgoId,
+      cancelResult,
+      stopOrder
     };
   }
 }

@@ -255,7 +255,7 @@ export class TradeDaemon {
       let executed = 0;
 
       for (const position of openPositions) {
-        const action = await this.planPositionManagement({ position, market, autoExecute });
+        const action = await this.planPositionManagement({ position, market, settings, autoExecute });
         if (action) {
           actions.push(action);
           if (action.executed) executed += 1;
@@ -378,24 +378,40 @@ export class TradeDaemon {
     };
   }
 
-  async planPositionManagement({ position, market, autoExecute }) {
+  async planPositionManagement({ position, market, settings, autoExecute }) {
     if (shouldPartialTakeProfit(position, market.quote)) {
       if (!autoExecute) {
         return { action: "would_partial_tp", tradeId: position.id, reason: "fakeout_1.5R", executed: false };
       }
-      return { action: "partial_tp_pending_p0_3", tradeId: position.id, executed: false };
+      const result = await this.executor.closeHalfPosition(position.id, {
+        storage: this.storage,
+        settings
+      });
+      return { action: "partial_tp", tradeId: position.id, result, executed: true };
     }
     if (shouldTrailingClose(position, market.h4)) {
       if (!autoExecute) {
         return { action: "would_trailing_close", tradeId: position.id, reason: "MA10_H4_cross", executed: false };
       }
-      return { action: "trailing_close_pending_p0_3", tradeId: position.id, executed: false };
+      const result = await this.executor.closePosition(position.id, {
+        storage: this.storage,
+        settings,
+        reason: "trailing_stop",
+        exitPrice: market.h4.at(-1)?.close
+      });
+      return { action: "trailing_close", tradeId: position.id, result, executed: true };
     }
     if (shouldTimeout(position)) {
       if (!autoExecute) {
         return { action: "would_timeout_close", tradeId: position.id, reason: "max_hold_reached", executed: false };
       }
-      return { action: "timeout_close_pending_p0_3", tradeId: position.id, executed: false };
+      const result = await this.executor.closePosition(position.id, {
+        storage: this.storage,
+        settings,
+        reason: "timeout",
+        exitPrice: market.quote?.mid || position.price
+      });
+      return { action: "timeout_close", tradeId: position.id, result, executed: true };
     }
     return null;
   }

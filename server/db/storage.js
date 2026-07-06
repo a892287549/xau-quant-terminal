@@ -303,7 +303,7 @@ export class Storage {
     const result = await this.db.query(
       `SELECT *
        FROM trades
-       WHERE status = 'open'
+       WHERE status IN ('open', 'partial_closed')
        ORDER BY COALESCE(opened_at, created_at) DESC
        LIMIT $1`,
       [limit]
