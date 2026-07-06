@@ -260,11 +260,50 @@ function stopOrderIdFromOrder(order) {
   return response.algoId || response.ordId || response.clOrdId || "";
 }
 
+function orderIdFromOrder(order = {}) {
+  const response = orderResponse(order);
+  return response.ordId || "";
+}
+
+function clientOrderIdFromOrder(order = {}) {
+  const response = orderResponse(order);
+  return response.clOrdId || order.request?.clOrdId || "";
+}
+
 function partialTakeProfitR(position, settings = {}) {
   const type = positionType(position);
   if (type === "fakeout") return Number(settings?.strategy?.exitRules?.fakeoutTp1R || 1.5);
   if (type === "support_reversal") return Number(settings?.risk?.supportReversalTp1R || 2);
   return 0;
+}
+
+export function partialTargetForSignal(signal = {}, actualEntry = null, size = 0, settings = {}) {
+  const type = signal.type || signal.signalType || "";
+  const fakeoutEnabled = Boolean(settings?.strategy?.exitRules?.fakeoutPartialTP);
+  if (type === "fakeout" && !fakeoutEnabled) return null;
+  if (!["fakeout", "support_reversal"].includes(type)) return null;
+  if (!["LONG", "SHORT"].includes(signal.direction)) return null;
+  const entry = Number(actualEntry || signal.entry);
+  const stop = Number(signal.stop);
+  const totalSize = Number(size);
+  const r = Math.abs(entry - stop);
+  const takeProfitR = type === "fakeout"
+    ? Number(settings?.strategy?.exitRules?.fakeoutTp1R || 1.5)
+    : Number(settings?.risk?.supportReversalTp1R || 2);
+  const minOrderSize = Number(settings?.daemon?.minOrderSize || process.env.OKX_MIN_ORDER_SIZE || 0.01);
+  const targetSize = floorLot(totalSize / 2, minOrderSize);
+  const remainingSize = floorLot(totalSize - targetSize, minOrderSize);
+  if (!Number.isFinite(entry) || !Number.isFinite(stop) || !Number.isFinite(totalSize) || r <= 0 || takeProfitR <= 0) return null;
+  if (targetSize < minOrderSize || remainingSize < minOrderSize) return null;
+  return {
+    type,
+    reason: `${type}_${takeProfitR}R`,
+    r: takeProfitR,
+    side: closeSideForDirection(signal.direction),
+    price: round(entry + directionSign(signal.direction) * r * takeProfitR, 2),
+    size: targetSize.toFixed(2),
+    remainingSize: remainingSize.toFixed(2)
+  };
 }
 
 function shouldPartialTakeProfit(position, quote, settings = {}) {
@@ -631,6 +670,40 @@ export class TradeDaemon {
     };
   }
 
+  async placePartialTargetIfNeeded({ signal, settings, actualEntry, size, tradeId }) {
+    const target = partialTargetForSignal(signal, actualEntry, size, settings);
+    if (!target) return null;
+    try {
+      const order = await this.executor.placeReduceOnlyLimitOrder({
+        instrument: this.okx.instrument,
+        side: target.side,
+        size: target.size,
+        price: target.price,
+        clientOrderId: compactId("ptgt")
+      }, settings);
+      return {
+        ...target,
+        placedAt: new Date().toISOString(),
+        orderId: orderIdFromOrder(order),
+        clOrdId: clientOrderIdFromOrder(order),
+        order
+      };
+    } catch (error) {
+      logger.error({
+        module: "tradeDaemon",
+        signalId: signal.id,
+        tradeId,
+        error: error.reason || error.message
+      }, "partial target placement failed");
+      return {
+        ...target,
+        failedAt: new Date().toISOString(),
+        error: error.reason || error.message,
+        errorPayload: error.payload || null
+      };
+    }
+  }
+
   async planSignalExecution({ signal, openPositions, risk, settings, autoExecute }) {
     const same = openPositions.find((position) => position.direction === signal.direction);
     const opposite = openPositions.find((position) => position.direction !== signal.direction);
@@ -741,6 +814,34 @@ export class TradeDaemon {
         clientOrderId: compactId("open")
       }, settings);
       const actualFill = fillPriceFromOrder(order, signal.entry);
+      const partialTarget = await this.placePartialTargetIfNeeded({
+        signal,
+        settings,
+        actualEntry: actualFill || signal.entry,
+        size,
+        tradeId
+      });
+      const events = [
+        { at: new Date().toISOString(), type: "opened", signalId: signal.id, order }
+      ];
+      if (partialTarget?.orderId || partialTarget?.clOrdId) {
+        events.push({
+          at: partialTarget.placedAt,
+          type: "partial_target_placed",
+          price: partialTarget.price,
+          size: partialTarget.size,
+          orderId: partialTarget.orderId,
+          clOrdId: partialTarget.clOrdId
+        });
+      } else if (partialTarget?.error) {
+        events.push({
+          at: partialTarget.failedAt,
+          type: "partial_target_failed",
+          price: partialTarget.price,
+          size: partialTarget.size,
+          error: partialTarget.error
+        });
+      }
       await this.storage.updateTrade(tradeId, {
         entry: actualFill || signal.entry,
         status: "open",
@@ -752,9 +853,14 @@ export class TradeDaemon {
           signalGrade: signal.grade,
           requestedSize: size,
           actualFill,
-          events: [
-            { at: new Date().toISOString(), type: "opened", signalId: signal.id, order }
-          ]
+          partialTarget,
+          partialTargetOrderId: partialTarget?.orderId || "",
+          partialTargetClOrdId: partialTarget?.clOrdId || "",
+          partialTargetPrice: partialTarget?.price || null,
+          partialTargetSize: partialTarget?.size || null,
+          partialTargetRemainingSize: partialTarget?.remainingSize || null,
+          originalSize: size,
+          events
         }
       });
       await this.storage.recordExecutionAudit?.({
@@ -782,7 +888,8 @@ export class TradeDaemon {
         type: signal.type,
         entry: actualFill || signal.entry,
         size,
-        status: "open"
+        status: "open",
+        payload: { partialTarget }
       });
       return {
         action: "opened",
@@ -813,8 +920,115 @@ export class TradeDaemon {
     }
   }
 
+  async syncPartialTargetOrder({ position, settings }) {
+    if (hasPartialTakeProfit(position)) return null;
+    const payload = position.payload || {};
+    const ordId = payload.partialTargetOrderId || payload.partialTarget?.orderId || "";
+    const clOrdId = payload.partialTargetClOrdId || payload.partialTarget?.clOrdId || "";
+    if (!ordId && !clOrdId) return null;
+    let fill = null;
+    try {
+      fill = await this.executor.getManagedOrderFill({
+        instrument: position.symbol || this.okx.instrument,
+        ordId,
+        clOrdId,
+        settings
+      });
+    } catch (error) {
+      logger.warn({
+        module: "tradeDaemon",
+        tradeId: position.id,
+        ordId,
+        clOrdId,
+        error: error.reason || error.message
+      }, "partial target sync failed");
+      return { inactive: true, error: error.reason || error.message };
+    }
+    if (!fill) return null;
+    if (fill.confirmed) {
+      const minOrderSize = Number(settings?.daemon?.minOrderSize || process.env.OKX_MIN_ORDER_SIZE || 0.01);
+      const closedSize = floorLot(Number(fill.accFillSz || payload.partialTargetSize || Number(position.size || 0) / 2), minOrderSize);
+      const remainingSize = floorLot(Math.max(0, Number(position.size || 0) - closedSize), minOrderSize);
+      const fillPx = Number(fill.fillPx || payload.partialTargetPrice || position.entry);
+      const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+      const partialPnl = Number.isFinite(fillPx)
+        ? (fillPx - Number(position.entry)) * directionSign(position.direction) * closedSize * pnlMultiplier
+        : 0;
+      await this.storage.updateTrade(position.id, {
+        size: remainingSize,
+        status: "partial_closed",
+        payload: {
+          ...payload,
+          partialTpAt: new Date().toISOString(),
+          partialTargetFilledAt: new Date().toISOString(),
+          partialTargetFill: fill,
+          partialTpOrder: payload.partialTarget?.order || null,
+          originalSize: payload.originalSize || position.size,
+          events: [
+            ...(payload.events || []),
+            {
+              at: new Date().toISOString(),
+              type: "partial_target_filled",
+              sizeClosed: closedSize,
+              remainingSize,
+              pnl: round(partialPnl),
+              fill
+            }
+          ]
+        }
+      });
+      await this.storage.recordExecutionAudit?.({
+        tradeId: position.id,
+        signalEntry: position.entry,
+        actualFill: Number.isFinite(fillPx) ? fillPx : null,
+        slippagePct: null,
+        expectedStop: position.stop || payload.stop || null,
+        actualStopOrderId: ordId || clOrdId,
+        stopFillPrice: null,
+        stopSlippagePct: null,
+        fee: fill.fee || 0,
+        feeAsset: fill.feeCcy || "USDT",
+        payload: {
+          reason: "partial_target",
+          sizeClosed: closedSize,
+          remainingSize,
+          fill
+        }
+      });
+      return {
+        filled: true,
+        action: {
+          action: "partial_target_filled",
+          tradeId: position.id,
+          result: {
+            sizeClosed: closedSize,
+            remainingSize,
+            pnl: round(partialPnl),
+            fill
+          },
+          executed: true
+        }
+      };
+    }
+    if (["live", "partially_filled", ""].includes(fill.state)) {
+      return { pending: true, fill };
+    }
+    return { inactive: true, fill };
+  }
+
   async planPositionManagement({ position, market, settings, autoExecute }) {
-    if (shouldPartialTakeProfit(position, market.quote, settings)) {
+    const partialTargetState = autoExecute
+      ? await this.syncPartialTargetOrder({ position, settings })
+      : null;
+    if (partialTargetState?.filled) {
+      await this.safeNotify(() => this.notifier.notifyPartialTakeProfit(settings, {
+        position,
+        pnl: partialTargetState.action.result?.pnl || 0,
+        label: `${partialTakeProfitR(position, settings)}R`
+      }));
+      return partialTargetState.action;
+    }
+    if (!partialTargetState?.pending && shouldPartialTakeProfit(position, market.quote, settings)) {
       if (!autoExecute) {
         return { action: "would_partial_tp", tradeId: position.id, reason: `${positionType(position)}_${partialTakeProfitR(position, settings)}R`, executed: false };
       }

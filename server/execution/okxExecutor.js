@@ -40,6 +40,20 @@ function responseData(payload) {
   return payload?.data?.[0] || payload?.response || payload || {};
 }
 
+function ensureAccepted(payload, operation = "OKX order") {
+  const row = responseData(payload);
+  const sCode = row.sCode || payload?.code;
+  if (sCode && sCode !== "0") {
+    throw new OkxExecutionError(row.sMsg || payload?.msg || `${operation} rejected by OKX`, {
+      status: 400,
+      retryable: sCode === "50011",
+      payload,
+      reason: `okx_${sCode}`
+    });
+  }
+  return row;
+}
+
 function orderIdentifier(payload = {}) {
   const row = responseData(payload);
   return {
@@ -297,6 +311,11 @@ export class OkxExecutor {
     return responseData(payload);
   }
 
+  async getManagedOrderFill({ instrument = this.instrument, ordId = "", clOrdId = "", settings = {} } = {}) {
+    const details = await this.getOrderDetails({ instrument, ordId, clOrdId, settings });
+    return details ? normalizeOrderFill(details, { ordId, clOrdId }) : null;
+  }
+
   async waitForOrderFill(order, { instrument = this.instrument, settings = {}, timeoutMs = 12000, pollMs = 600 } = {}) {
     const ids = orderIdentifier(order);
     const fallback = responseData(order);
@@ -342,7 +361,7 @@ export class OkxExecutor {
       body,
       settings
     });
-    const response = payload.data?.[0] || payload;
+    const response = ensureAccepted(payload, "OKX market order");
     const result = {
       mode: this.tradingMode(settings),
       request: body,
@@ -367,6 +386,85 @@ export class OkxExecutor {
     };
   }
 
+  async placeReduceOnlyLimitOrder({
+    instrument = this.instrument,
+    side,
+    size,
+    price,
+    tdMode = "cross",
+    clientOrderId
+  } = {}, settings = {}) {
+    const guard = this.guard(settings);
+    if (!guard.ok) {
+      throw new OkxExecutionError("OKX order submission is disabled", {
+        status: 400,
+        reason: guard.reason
+      });
+    }
+    if (!["buy", "sell"].includes(side)) {
+      throw new OkxExecutionError("OKX order side must be buy or sell", { reason: "invalid_side" });
+    }
+    const roundedSize = roundLot(size);
+    const roundedPrice = Number(price);
+    if (!Number.isFinite(roundedPrice) || roundedPrice <= 0) {
+      throw new OkxExecutionError("OKX limit price is required", { reason: "missing_price" });
+    }
+    const body = {
+      instId: instrument,
+      tdMode,
+      side,
+      ordType: "limit",
+      px: String(roundedPrice),
+      sz: String(roundedSize),
+      clOrdId: clientOrderId || compactId("ptgt"),
+      reduceOnly: "true"
+    };
+    const payload = await this.request("/api/v5/trade/order", {
+      method: "POST",
+      body,
+      settings
+    });
+    return {
+      mode: this.tradingMode(settings),
+      request: body,
+      response: ensureAccepted(payload, "OKX limit order")
+    };
+  }
+
+  async cancelOrder({ instrument = this.instrument, ordId = "", clOrdId = "", settings = {} } = {}) {
+    if (!ordId && !clOrdId) return { skipped: true, reason: "missing_order_id" };
+    const body = {
+      instId: instrument
+    };
+    if (ordId) body.ordId = ordId;
+    if (clOrdId) body.clOrdId = clOrdId;
+    const payload = await this.request("/api/v5/trade/cancel-order", {
+      method: "POST",
+      body,
+      settings
+    });
+    return {
+      request: body,
+      response: ensureAccepted(payload, "OKX cancel order")
+    };
+  }
+
+  async cancelManagedOrder(orderRef = {}, settings = {}) {
+    const ordId = orderRef.ordId || orderRef.orderId || orderRef.partialTargetOrderId || "";
+    const clOrdId = orderRef.clOrdId || orderRef.clientOrderId || orderRef.partialTargetClOrdId || "";
+    const instrument = orderRef.instrument || this.instrument;
+    if (!ordId && !clOrdId) return { skipped: true, reason: "missing_order_id" };
+    try {
+      return await this.cancelOrder({ instrument, ordId, clOrdId, settings });
+    } catch (error) {
+      return {
+        skipped: false,
+        error: error.reason || error.message,
+        payload: error.payload || null
+      };
+    }
+  }
+
   async closePosition(positionId, { storage, settings = {}, reason = "closed", exitPrice = null } = {}) {
     if (!storage?.enabled) {
       throw new OkxExecutionError("Storage is required to close a managed position", { reason: "storage_missing" });
@@ -375,6 +473,11 @@ export class OkxExecutor {
     if (!trade) {
       throw new OkxExecutionError(`Trade ${positionId} was not found`, { reason: "trade_not_found" });
     }
+    const partialTargetCancel = await this.cancelManagedOrder({
+      instrument: trade.symbol || this.instrument,
+      ordId: trade.payload?.partialTargetOrderId,
+      clOrdId: trade.payload?.partialTargetClOrdId
+    }, settings);
     const size = roundLot(trade.size);
     const order = await this.placePerpetualMarketOrder({
       instrument: trade.symbol || this.instrument,
@@ -398,9 +501,10 @@ export class OkxExecutor {
         ...(trade.payload || {}),
         exitReason: reason,
         closeOrder: order,
+        partialTargetCancel,
         events: [
           ...((trade.payload || {}).events || []),
-          { at: new Date().toISOString(), type: "closed", reason, order }
+          { at: new Date().toISOString(), type: "closed", reason, order, partialTargetCancel }
         ]
       }
     });
@@ -444,6 +548,11 @@ export class OkxExecutor {
     if (totalSize < 0.02) {
       throw new OkxExecutionError("Position is too small for partial close", { reason: "partial_size_too_small" });
     }
+    const partialTargetCancel = await this.cancelManagedOrder({
+      instrument: trade.symbol || this.instrument,
+      ordId: trade.payload?.partialTargetOrderId,
+      clOrdId: trade.payload?.partialTargetClOrdId
+    }, settings);
     const size = roundLot(totalSize / 2);
     const remainingSize = floorLot(totalSize - size);
     const order = await this.placePerpetualMarketOrder({
@@ -460,10 +569,11 @@ export class OkxExecutor {
         ...(trade.payload || {}),
         partialTpAt: new Date().toISOString(),
         partialTpOrder: order,
+        partialTargetCancel,
         originalSize: trade.payload?.originalSize || trade.size,
         events: [
           ...((trade.payload || {}).events || []),
-          { at: new Date().toISOString(), type: "partial_tp", sizeClosed: size, remainingSize, order }
+          { at: new Date().toISOString(), type: "partial_tp", sizeClosed: size, remainingSize, order, partialTargetCancel }
         ]
       }
     });
@@ -521,7 +631,7 @@ export class OkxExecutor {
     });
     return {
       request: body,
-      response: responseData(payload)
+      response: ensureAccepted(payload, "OKX stop algo")
     };
   }
 
