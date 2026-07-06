@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import * as cheerio from "cheerio";
 import { macroCompass as mockMacroCompass } from "../mockData.mjs";
+import { logger } from "../logger.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TREASURY_REAL_YIELD_URL = "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/TextView";
@@ -346,7 +347,7 @@ export function startMacroScheduler(fetcher, { enabled = async () => true } = {}
         await fetcher.getSnapshot({ force: true });
       }
     } catch (error) {
-      console.warn(`macro scheduler skipped: ${error.message}`);
+      logger.warn({ module: "macroFetcher", error: error.message }, "macro scheduler skipped");
     }
   };
   const timer = setInterval(tick, 60 * 60 * 1000);

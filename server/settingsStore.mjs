@@ -1,5 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { logger } from "./logger.js";
 
 export const defaultSettings = {
   api: {
@@ -193,7 +194,7 @@ export class SettingsStore {
         const saved = await this.storage.readConfig("settings");
         if (saved) return normalizeSettings(deepMerge(defaultSettings, saved));
       } catch (error) {
-        console.warn(`settings db read failed, falling back to file: ${error.message}`);
+        logger.warn({ module: "settingsStore", error: error.message }, "settings db read failed, falling back to file");
       }
     }
     try {
@@ -203,7 +204,7 @@ export class SettingsStore {
         try {
           await this.storage.writeConfig("settings", merged);
         } catch (error) {
-          console.warn(`settings db migration failed: ${error.message}`);
+          logger.warn({ module: "settingsStore", error: error.message }, "settings db migration failed");
         }
       }
       return merged;
@@ -220,7 +221,7 @@ export class SettingsStore {
       try {
         await this.storage.writeConfig("settings", merged);
       } catch (error) {
-        console.warn(`settings db write failed, keeping file fallback: ${error.message}`);
+        logger.warn({ module: "settingsStore", error: error.message }, "settings db write failed, keeping file fallback");
       }
     }
     await writeFile(this.filePath, `${JSON.stringify(merged, null, 2)}\n`, "utf8");

@@ -15,6 +15,7 @@ import { TradeDaemon } from "./daemon/tradeDaemon.js";
 import { FeishuNotifier } from "./notifications/feishuNotifier.js";
 import { WsHub } from "./realtime/wsHub.js";
 import { DataHealthMonitor } from "./monitor/dataHealth.js";
+import { logger } from "./logger.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
@@ -272,7 +273,7 @@ if (storage.enabled) {
   try {
     await storage.init();
   } catch (error) {
-    console.warn(`database init failed, continuing with file fallback: ${error.message}`);
+    logger.warn({ module: "server", error: error.message }, "database init failed, continuing with file fallback");
     storage.disable();
   }
 }
@@ -295,6 +296,6 @@ if (process.argv.includes("--smoke")) {
   dataHealthMonitor.start();
   tradeDaemon.start();
   server.listen(port, "0.0.0.0", () => {
-    console.log(`xau-quant-terminal listening on ${port}`);
+    logger.info({ module: "server", port }, "xau-quant-terminal listening");
   });
 }

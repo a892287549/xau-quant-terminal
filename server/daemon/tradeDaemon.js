@@ -1,4 +1,5 @@
 import { runSignalEngine } from "../engine/signalEngine.js";
+import { logger } from "../logger.js";
 
 const EXECUTABLE_GRADES = new Set(["S", "A", "B"]);
 const HOUR_MS = 60 * 60 * 1000;
@@ -277,13 +278,17 @@ export class TradeDaemon {
       const settings = await this.getSettings();
       const daemon = settings?.daemon || {};
       if (!daemon.enabled) {
-        console.log(`[${new Date().toISOString()}] trade daemon disabled`);
+        logger.info({ module: "tradeDaemon" }, "trade daemon disabled");
         return;
       }
       const intervalMs = Math.max(1, Number(daemon.scanIntervalMinutes || 5)) * 60 * 1000;
       this.timer = setInterval(() => this.scanOnce().catch((error) => this.logError(error)), intervalMs);
       setTimeout(() => this.scanOnce().catch((error) => this.logError(error)), 2500);
-      console.log(`[${new Date().toISOString()}] trade daemon started interval=${intervalMs / 60000}m autoExecute=${Boolean(daemon.autoExecute)}`);
+      logger.info({
+        module: "tradeDaemon",
+        scanIntervalMinutes: intervalMs / 60000,
+        autoExecute: Boolean(daemon.autoExecute)
+      }, "trade daemon started");
     };
     boot().catch((error) => this.logError(error));
   }
@@ -294,7 +299,7 @@ export class TradeDaemon {
   }
 
   logError(error) {
-    console.error(`[${new Date().toISOString()}] trade daemon error: ${error.message}`);
+    logger.error({ module: "tradeDaemon", error: error.message }, "trade daemon error");
   }
 
   async fetchMarket() {
@@ -378,8 +383,21 @@ export class TradeDaemon {
       this.broadcast("signal", signals);
       this.broadcast("position", openPositions);
       this.broadcast("risk", risk);
-      console.log(`[${this.lastScan}] 扫描完成，信号 ${signals.length} 个，执行 ${executed} 笔，持仓 ${openPositions.length} 个，mode=${autoExecute ? "execute" : "dry-run"}`);
-      actions.slice(0, 8).forEach((action) => console.log(`[${this.lastScan}] daemon ${action.action}: ${action.reason || action.signalId || action.tradeId || ""}`));
+      logger.info({
+        module: "tradeDaemon",
+        signals: signals.length,
+        executed,
+        positions: openPositions.length,
+        mode: autoExecute ? "execute" : "dry-run",
+        riskReasons: risk.reasons
+      }, "scan completed");
+      actions.slice(0, 8).forEach((action) => logger.info({
+        module: "tradeDaemon",
+        action: action.action,
+        tradeId: action.tradeId,
+        signalId: action.signalId,
+        reason: action.reason
+      }, "daemon action"));
       return this.lastResult;
     } finally {
       this.running = false;
@@ -390,7 +408,7 @@ export class TradeDaemon {
     try {
       this.broadcaster?.broadcast?.(type, data);
     } catch (error) {
-      console.warn(`[${new Date().toISOString()}] websocket broadcast failed: ${error.message}`);
+      logger.warn({ module: "tradeDaemon", type, error: error.message }, "websocket broadcast failed");
     }
   }
 
@@ -399,7 +417,7 @@ export class TradeDaemon {
     try {
       await task();
     } catch (error) {
-      console.warn(`[${new Date().toISOString()}] feishu notify failed: ${error.message}`);
+      logger.warn({ module: "tradeDaemon", error: error.message }, "feishu notify failed");
     }
   }
 

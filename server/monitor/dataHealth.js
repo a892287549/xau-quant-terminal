@@ -1,3 +1,5 @@
+import { logger } from "../logger.js";
+
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -43,12 +45,12 @@ export class DataHealthMonitor {
   start() {
     if (this.timer) return;
     this.timer = setInterval(() => this.checkOnce().catch((error) => {
-      console.warn(`[${new Date().toISOString()}] data health check failed: ${error.message}`);
+      logger.warn({ module: "dataHealth", error: error.message }, "data health check failed");
     }), this.intervalMs);
     setTimeout(() => this.checkOnce().catch((error) => {
-      console.warn(`[${new Date().toISOString()}] data health check failed: ${error.message}`);
+      logger.warn({ module: "dataHealth", error: error.message }, "data health check failed");
     }), 6000);
-    console.log(`[${new Date().toISOString()}] data health monitor started interval=${this.intervalMs / 60000}m`);
+    logger.info({ module: "dataHealth", intervalMinutes: this.intervalMs / 60000 }, "data health monitor started");
   }
 
   stop() {
@@ -84,7 +86,7 @@ export class DataHealthMonitor {
         "XAU 数据质量"
       );
     } catch (error) {
-      console.warn(`[${new Date().toISOString()}] data health notify failed: ${error.message}`);
+      logger.warn({ module: "dataHealth", error: error.message }, "data health notify failed");
     }
   }
 
