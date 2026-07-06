@@ -133,6 +133,39 @@ function candidateTradeId(signal) {
   return `TRD-${signal.id || compactId("SIG")}`.slice(0, 64);
 }
 
+function orderResponse(order = {}) {
+  return order.response || order.data?.[0] || order || {};
+}
+
+function fillPriceFromOrder(order, fallback) {
+  const response = orderResponse(order);
+  const parsed = Number(response.fillPx || response.avgPx || response.px || fallback);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function feeFromOrder(order) {
+  const response = orderResponse(order);
+  const fee = Number(response.fee || response.fillFee || 0);
+  return Number.isFinite(fee) ? fee : 0;
+}
+
+function feeAssetFromOrder(order) {
+  const response = orderResponse(order);
+  return response.feeCcy || response.fillFeeCcy || "USDT";
+}
+
+function slippagePct(expected, actual, direction) {
+  const entry = Number(expected);
+  const fill = Number(actual);
+  if (!entry || !fill) return 0;
+  return round(((fill - entry) / entry) * 100 * directionSign(direction), 4);
+}
+
+function stopOrderIdFromOrder(order) {
+  const response = orderResponse(order);
+  return response.algoId || response.ordId || response.clOrdId || "";
+}
+
 function shouldPartialTakeProfit(position, quote) {
   if (positionType(position) !== "fakeout" || hasPartialTakeProfit(position)) return false;
   const entry = Number(position.entry);
@@ -433,6 +466,20 @@ export class TradeDaemon {
       signalGrade: signal.grade,
       signalId: signal.id,
       payload: { signal, order }
+    });
+    const actualFill = fillPriceFromOrder(order, signal.entry);
+    await this.storage.recordExecutionAudit?.({
+      tradeId,
+      signalEntry: signal.entry,
+      actualFill,
+      slippagePct: slippagePct(signal.entry, actualFill, signal.direction),
+      expectedStop: signal.stop,
+      actualStopOrderId: stopOrderIdFromOrder(order),
+      stopFillPrice: null,
+      stopSlippagePct: null,
+      fee: feeFromOrder(order),
+      feeAsset: feeAssetFromOrder(order),
+      payload: { signalId: signal.id, order }
     });
     await this.safeNotify(() => this.notifier.notifyOpen(settings, {
       signal,

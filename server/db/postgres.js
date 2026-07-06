@@ -129,6 +129,24 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
   payload JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 CREATE INDEX IF NOT EXISTS backtest_trades_run_idx ON backtest_trades (run_id, opened_at);
+
+CREATE TABLE IF NOT EXISTS execution_audit (
+  id BIGSERIAL PRIMARY KEY,
+  trade_id TEXT REFERENCES trades(id),
+  signal_entry NUMERIC(12,2),
+  actual_fill NUMERIC(12,2),
+  slippage_pct NUMERIC(8,4),
+  expected_stop NUMERIC(12,2),
+  stop_order_id VARCHAR(64),
+  stop_fill_price NUMERIC(12,2),
+  stop_slippage_pct NUMERIC(8,4),
+  fee NUMERIC(12,4),
+  fee_asset VARCHAR(10),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS execution_audit_trade_idx ON execution_audit (trade_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS execution_audit_created_idx ON execution_audit (created_at DESC);
 `;
 
 export function createDatabase() {

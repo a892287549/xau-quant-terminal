@@ -110,6 +110,24 @@ function backtestRunFromRow(row) {
   };
 }
 
+function executionAuditFromRow(row) {
+  return {
+    id: row.id,
+    tradeId: row.trade_id,
+    signalEntry: num(row.signal_entry),
+    actualFill: num(row.actual_fill),
+    slippagePct: num(row.slippage_pct) || 0,
+    expectedStop: num(row.expected_stop),
+    stopOrderId: row.stop_order_id || "",
+    stopFillPrice: num(row.stop_fill_price),
+    stopSlippagePct: num(row.stop_slippage_pct) || 0,
+    fee: num(row.fee) || 0,
+    feeAsset: row.fee_asset || "USDT",
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+    payload: row.payload || {}
+  };
+}
+
 export class Storage {
   constructor(db) {
     this.db = db;
@@ -406,6 +424,42 @@ export class Storage {
       }
     });
     return true;
+  }
+
+  async recordExecutionAudit(record = {}) {
+    if (!this.enabled) return false;
+    await this.db.query(
+      `INSERT INTO execution_audit (
+        trade_id, signal_entry, actual_fill, slippage_pct, expected_stop,
+        stop_order_id, stop_fill_price, stop_slippage_pct, fee, fee_asset, payload
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)`,
+      [
+        record.tradeId || null,
+        record.signalEntry ?? null,
+        record.actualFill ?? null,
+        record.slippagePct ?? null,
+        record.expectedStop ?? null,
+        record.actualStopOrderId || record.stopOrderId || "",
+        record.stopFillPrice ?? null,
+        record.stopSlippagePct ?? null,
+        record.fee ?? null,
+        record.feeAsset || "USDT",
+        JSON.stringify(record.payload || record)
+      ]
+    );
+    return true;
+  }
+
+  async getExecutionAudit(limit = 20) {
+    if (!this.enabled) return [];
+    const result = await this.db.query(
+      `SELECT *
+       FROM execution_audit
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return result.rows.map(executionAuditFromRow);
   }
 
   async getTradeHistory(limit = 200) {

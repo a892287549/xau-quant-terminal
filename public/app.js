@@ -1048,6 +1048,38 @@ function compareMetricSummary(item) {
   `;
 }
 
+function renderExecutionAudit(rows = []) {
+  const slippages = rows.map((row) => Number(row.slippagePct || 0)).filter((value) => Number.isFinite(value));
+  const avgSlip = slippages.length ? slippages.reduce((sum, value) => sum + Math.abs(value), 0) / slippages.length : 0;
+  const maxSlip = slippages.length ? Math.max(...slippages.map((value) => Math.abs(value))) : 0;
+  const totalFee = rows.reduce((sum, row) => sum + Number(row.fee || 0), 0);
+  return `
+    <div class="metric-strip">
+      ${metric("平均滑点", fmt(avgSlip, "%"), "最近20笔")}
+      ${metric("最大滑点", fmt(maxSlip, "%"), "绝对值")}
+      ${metric("手续费", fmt(totalFee, " USDT"), "审计样本")}
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>Trade</th><th>信号价</th><th>成交价</th><th>滑点</th><th>止损单</th><th>手续费</th></tr></thead>
+        <tbody>
+          ${rows.length ? rows.map((row) => `
+            <tr>
+              <td>${dateShort(row.createdAt)}</td>
+              <td>${esc(row.tradeId || "")}</td>
+              <td>${fmt(row.signalEntry)}</td>
+              <td>${fmt(row.actualFill)}</td>
+              <td class="${Math.abs(Number(row.slippagePct || 0)) > 0.05 ? "warning" : "neutral"}">${fmt(row.slippagePct, "%")}</td>
+              <td>${esc(row.stopOrderId || "")}</td>
+              <td>${fmt(row.fee, ` ${row.feeAsset || "USDT"}`)}</td>
+            </tr>
+          `).join("") : `<tr><td colspan="7" class="neutral">暂无执行审计记录</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
 function renderBacktests() {
   const catalog = state.data.backtests;
   const result = state.backtestResult || catalog.lastRuns[0];
@@ -1161,6 +1193,7 @@ function renderSettings() {
   const payload = state.data.settings;
   const settings = payload.settings;
   const deployment = payload.deployment;
+  const executionAudit = payload.executionAudit || [];
   return `
     <form id="settingsForm" class="grid">
       <section class="panel span-6">
@@ -1203,6 +1236,11 @@ function renderSettings() {
           ${toggle("notifications.feishu.enabled", "启用飞书机器人", settings.notifications?.feishu?.enabled ?? false)}
           <label>Webhook URL<input name="notifications.feishu.webhookUrl" value="${esc(settings.notifications?.feishu?.webhookUrl || "")}" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></label>
         </div>
+      </section>
+
+      <section class="panel span-12">
+        <h2>执行审计</h2>
+        ${renderExecutionAudit(executionAudit)}
       </section>
 
       <section class="panel span-6">

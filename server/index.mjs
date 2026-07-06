@@ -197,6 +197,7 @@ async function handleApi(req, res, url) {
     return json(res, {
       settings,
       deployment: deploymentInfo(startedAt),
+      executionAudit: await storage.getExecutionAudit?.(20) || [],
       logs: dataProvider.logs()
     });
   }
