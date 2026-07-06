@@ -1280,7 +1280,7 @@ function renderSettings() {
             ${[["disabled", "禁用"], ["okx", "OKX"], ["oanda", "OANDA"], ["mt5", "MT5"], ["ib", "IB"]].map(([value, label]) => `<option value="${value}" ${settings.api.broker === value ? "selected" : ""}>${label}</option>`).join("")}
           </select></label>
           <label>交易模式<select name="api.tradeMode">
-            ${[["demo", "模拟"], ["live", "实盘"]].map(([value, label]) => `<option value="${value}" ${settings.api.tradeMode === value ? "selected" : ""}>${label}</option>`).join("")}
+            ${[["paper", "纸盘（本地）"], ["live", "实盘"]].map(([value, label]) => `<option value="${value}" ${settings.api.tradeMode === value ? "selected" : ""}>${label}</option>`).join("")}
           </select></label>
           ${toggle("api.oandaTokenConfigured", "OANDA Key 已放入服务器", settings.api.oandaTokenConfigured)}
           ${toggle("api.okxTradingConfigured", "OKX 交易 Key 已放入服务器", settings.api.okxTradingConfigured)}

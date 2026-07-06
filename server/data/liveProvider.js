@@ -345,6 +345,10 @@ export function isRealDataMode(settings) {
   return settings?.api?.dataMode === "real";
 }
 
+function isPaperTradeMode(settings) {
+  return settings?.api?.tradeMode !== "live";
+}
+
 export class LiveDataProvider {
   constructor({ oandaAdapter, okxAdapter, macroFetcher, storage = null }) {
     this.oanda = oandaAdapter;
@@ -529,14 +533,15 @@ export class LiveDataProvider {
     const history = await this.storage.getTradeHistory(500);
     const latestRun = (await this.storage.getBacktestRuns(1))[0] || null;
     const warnings = [];
+    const useOkxPositions = !isPaperTradeMode(settings);
     const [quoteResult, okxResult] = await Promise.allSettled([
       this.okx.getPricing(),
-      this.okx.getPositions()
+      useOkxPositions ? this.okx.getPositions() : Promise.resolve([])
     ]);
     const quote = isSettledOk(quoteResult) ? quoteResult.value : null;
     const okxPositions = isSettledOk(okxResult) ? okxResult.value : [];
     if (!isSettledOk(quoteResult)) warnings.push(`okx pricing: ${quoteResult.reason?.message || "unavailable"}`);
-    if (!isSettledOk(okxResult)) warnings.push(`okx positions: ${okxResult.reason?.message || "unavailable"}`);
+    if (useOkxPositions && !isSettledOk(okxResult)) warnings.push(`okx positions: ${okxResult.reason?.message || "unavailable"}`);
     positions = mergeOkxPositions({
       positions,
       okxPositions,
@@ -549,7 +554,7 @@ export class LiveDataProvider {
     return {
       ...output,
       okxPositions,
-      okxStatus: isSettledOk(okxResult) ? "ok" : "unavailable",
+      okxStatus: useOkxPositions ? isSettledOk(okxResult) ? "ok" : "unavailable" : "paper_skipped",
       warnings
     };
   }

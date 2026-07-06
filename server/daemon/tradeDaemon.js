@@ -36,6 +36,15 @@ function directionSign(direction) {
   return direction === "SHORT" ? -1 : 1;
 }
 
+function isPaperExecution(settings = {}) {
+  return settings?.api?.tradeMode !== "live";
+}
+
+function quotePrice(market = {}, fallback = null) {
+  const value = Number(market.quote?.mid || market.quote?.last || fallback);
+  return Number.isFinite(value) ? value : null;
+}
+
 function startOfUtcDay(value = new Date()) {
   const date = new Date(value);
   date.setUTCHours(0, 0, 0, 0);
@@ -306,6 +315,50 @@ export function partialTargetForSignal(signal = {}, actualEntry = null, size = 0
   };
 }
 
+function paperOrder({ side, size, price, stop = null, clientOrderId, orderType = "market", state = "filled", reason = "paper" } = {}) {
+  const clOrdId = clientOrderId || compactId("paper");
+  const ordId = compactId("paperord");
+  const fillPx = Number(price);
+  return {
+    mode: "paper",
+    paper: true,
+    request: {
+      side,
+      size: String(size),
+      ordType: orderType,
+      px: Number.isFinite(fillPx) ? fillPx : null,
+      stopLossPrice: stop,
+      clOrdId
+    },
+    response: {
+      ordId,
+      clOrdId,
+      state,
+      reason
+    },
+    fill: {
+      confirmed: state === "filled",
+      state,
+      ordId,
+      clOrdId,
+      fillPx: Number.isFinite(fillPx) ? fillPx : null,
+      accFillSz: Number(size || 0),
+      fee: 0,
+      feeCcy: "USDT",
+      raw: { paper: true, reason }
+    }
+  };
+}
+
+function paperClosePnl(trade = {}, fill, size, settings = {}) {
+  const price = Number(fill);
+  const entry = Number(trade.entry);
+  const amount = Number(size || trade.size || 0);
+  const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+  if (!Number.isFinite(price) || !Number.isFinite(entry)) return Number(trade.pnl || 0);
+  return (price - entry) * directionSign(trade.direction) * amount * pnlMultiplier;
+}
+
 function shouldPartialTakeProfit(position, quote, settings = {}) {
   const takeProfitR = partialTakeProfitR(position, settings);
   if (!takeProfitR || hasPartialTakeProfit(position)) return false;
@@ -316,6 +369,13 @@ function shouldPartialTakeProfit(position, quote, settings = {}) {
   const r = Math.abs(entry - stop);
   const move = (current - entry) * directionSign(position.direction);
   return r > 0 && move >= r * takeProfitR;
+}
+
+function shouldStopLoss(position, quote) {
+  const stop = Number(position.stop || position.payload?.stop);
+  const current = Number(quote?.mid || quote?.last || position.price);
+  if (!Number.isFinite(stop) || !Number.isFinite(current)) return false;
+  return position.direction === "LONG" ? current <= stop : current >= stop;
 }
 
 function trailingPeriod(position, settings = {}) {
@@ -466,13 +526,14 @@ export class TradeDaemon {
       }
 
       for (const signal of signals) {
-        const action = await this.planSignalExecution({
-          signal,
-          openPositions,
-          risk,
-          settings,
-          autoExecute
-        });
+          const action = await this.planSignalExecution({
+            signal,
+            openPositions,
+            risk,
+            settings,
+            autoExecute,
+            market
+          });
         if (["would_open", "opened", "would_close_reverse_then_open"].includes(action.action)) {
           await this.notifySignalOnce(settings, signal);
         }
@@ -670,9 +731,129 @@ export class TradeDaemon {
     };
   }
 
+  async paperClosePosition(positionId, { settings = {}, reason = "closed", exitPrice = null } = {}) {
+    const trade = await this.storage.getTradeById(positionId);
+    if (!trade) throw new Error(`Trade ${positionId} was not found`);
+    const fill = Number(exitPrice || trade.exit || trade.entry);
+    const size = Number(trade.size || 0);
+    const order = paperOrder({
+      side: closeSideForDirection(trade.direction),
+      size,
+      price: fill,
+      clientOrderId: compactId("pcls"),
+      reason
+    });
+    const pnl = paperClosePnl(trade, fill, size, settings);
+    const status = reason === "timeout" ? "timeout" : reason === "stop_loss" ? "stopped_out" : "closed";
+    await this.storage.updateTrade(positionId, {
+      closedAt: new Date().toISOString(),
+      exit: Number.isFinite(fill) ? fill : null,
+      pnl: round(pnl),
+      status,
+      payload: {
+        ...(trade.payload || {}),
+        exitReason: reason,
+        closeOrder: order,
+        events: [
+          ...((trade.payload || {}).events || []),
+          { at: new Date().toISOString(), type: "paper_closed", reason, order }
+        ]
+      }
+    });
+    await this.storage.recordExecutionAudit?.({
+      tradeId: positionId,
+      signalEntry: trade.entry,
+      actualFill: null,
+      slippagePct: null,
+      expectedStop: trade.payload?.stop || null,
+      actualStopOrderId: order.response.ordId,
+      stopFillPrice: Number.isFinite(fill) ? fill : null,
+      stopSlippagePct: null,
+      fee: 0,
+      feeAsset: "USDT",
+      payload: { reason, order, paper: true }
+    });
+    return {
+      tradeId: positionId,
+      status,
+      sizeClosed: size,
+      remainingSize: 0,
+      pnl: round(pnl),
+      order
+    };
+  }
+
+  async paperCloseHalfPosition(positionId, { settings = {}, exitPrice = null } = {}) {
+    const trade = await this.storage.getTradeById(positionId);
+    if (!trade) throw new Error(`Trade ${positionId} was not found`);
+    const totalSize = Number(trade.size || 0);
+    if (totalSize < 0.02) throw new Error("Position is too small for partial close");
+    const size = floorLot(totalSize / 2, Number(settings?.daemon?.minOrderSize || 0.01));
+    const remainingSize = floorLot(totalSize - size, Number(settings?.daemon?.minOrderSize || 0.01));
+    const fill = Number(exitPrice || trade.payload?.partialTargetPrice || trade.entry);
+    const order = paperOrder({
+      side: closeSideForDirection(trade.direction),
+      size,
+      price: fill,
+      clientOrderId: compactId("pptp"),
+      reason: "partial_take_profit"
+    });
+    await this.storage.updateTrade(positionId, {
+      size: remainingSize,
+      status: "partial_closed",
+      payload: {
+        ...(trade.payload || {}),
+        partialTpAt: new Date().toISOString(),
+        partialTpOrder: order,
+        originalSize: trade.payload?.originalSize || trade.size,
+        events: [
+          ...((trade.payload || {}).events || []),
+          { at: new Date().toISOString(), type: "paper_partial_tp", sizeClosed: size, remainingSize, order }
+        ]
+      }
+    });
+    await this.storage.recordExecutionAudit?.({
+      tradeId: positionId,
+      signalEntry: trade.entry,
+      actualFill: order.fill.fillPx,
+      slippagePct: null,
+      expectedStop: trade.payload?.stop || null,
+      actualStopOrderId: order.response.ordId,
+      stopFillPrice: null,
+      stopSlippagePct: null,
+      fee: 0,
+      feeAsset: "USDT",
+      payload: { reason: "partial_take_profit", sizeClosed: size, remainingSize, order, paper: true }
+    });
+    return {
+      tradeId: positionId,
+      sizeClosed: size,
+      remainingSize,
+      order
+    };
+  }
+
   async placePartialTargetIfNeeded({ signal, settings, actualEntry, size, tradeId }) {
     const target = partialTargetForSignal(signal, actualEntry, size, settings);
     if (!target) return null;
+    if (isPaperExecution(settings)) {
+      const order = paperOrder({
+        side: target.side,
+        size: target.size,
+        price: target.price,
+        clientOrderId: compactId("ptgt"),
+        orderType: "limit",
+        state: "live",
+        reason: target.reason
+      });
+      return {
+        ...target,
+        placedAt: new Date().toISOString(),
+        orderId: order.response.ordId,
+        clOrdId: order.response.clOrdId,
+        order
+      };
+    }
     try {
       const order = await this.executor.placeReduceOnlyLimitOrder({
         instrument: this.okx.instrument,
@@ -704,7 +885,7 @@ export class TradeDaemon {
     }
   }
 
-  async planSignalExecution({ signal, openPositions, risk, settings, autoExecute }) {
+  async planSignalExecution({ signal, openPositions, risk, settings, autoExecute, market = {} }) {
     const same = openPositions.find((position) => position.direction === signal.direction);
     const opposite = openPositions.find((position) => position.direction !== signal.direction);
     if (same) {
@@ -752,14 +933,17 @@ export class TradeDaemon {
       };
     }
 
-    const guard = this.executor.guard(settings);
-    if (!guard.ok) {
-      return {
-        action: "skip_execution_guard",
-        signalId: signal.id,
-        reason: guard.reason,
-        executed: false
-      };
+    const paperExecution = isPaperExecution(settings);
+    if (!paperExecution) {
+      const guard = this.executor.guard(settings);
+      if (!guard.ok) {
+        return {
+          action: "skip_execution_guard",
+          signalId: signal.id,
+          reason: guard.reason,
+          executed: false
+        };
+      }
     }
     const executionHealth = await this.dataHealthMonitor?.checkBeforeTrade?.(settings);
     if (executionHealth && executionHealth.ok === false) {
@@ -800,19 +984,37 @@ export class TradeDaemon {
     }
     try {
       if (opposite) {
-        await this.executor.closePosition(opposite.id, {
-          storage: this.storage,
-          settings,
-          reason: "reverse_signal",
-          exitPrice: signal.entry
-        });
+        if (paperExecution) {
+          await this.paperClosePosition(opposite.id, {
+            settings,
+            reason: "reverse_signal",
+            exitPrice: quotePrice(market, signal.entry)
+          });
+        } else {
+          await this.executor.closePosition(opposite.id, {
+            storage: this.storage,
+            settings,
+            reason: "reverse_signal",
+            exitPrice: signal.entry
+          });
+        }
       }
-      const order = await this.executor.placePerpetualMarketOrder({
-        side: sideForDirection(signal.direction),
-        size,
-        stopLossPrice: signal.stop,
-        clientOrderId: compactId("open")
-      }, settings);
+      const paperFill = quotePrice(market, signal.entry);
+      const order = paperExecution
+        ? paperOrder({
+          side: sideForDirection(signal.direction),
+          size,
+          price: paperFill,
+          stop: signal.stop,
+          clientOrderId: compactId("open"),
+          reason: "open"
+        })
+        : await this.executor.placePerpetualMarketOrder({
+          side: sideForDirection(signal.direction),
+          size,
+          stopLossPrice: signal.stop,
+          clientOrderId: compactId("open")
+        }, settings);
       const actualFill = fillPriceFromOrder(order, signal.entry);
       const partialTarget = await this.placePartialTargetIfNeeded({
         signal,
@@ -920,29 +1122,59 @@ export class TradeDaemon {
     }
   }
 
-  async syncPartialTargetOrder({ position, settings }) {
+  async syncPartialTargetOrder({ position, settings, quote = null }) {
     if (hasPartialTakeProfit(position)) return null;
     const payload = position.payload || {};
     const ordId = payload.partialTargetOrderId || payload.partialTarget?.orderId || "";
     const clOrdId = payload.partialTargetClOrdId || payload.partialTarget?.clOrdId || "";
     if (!ordId && !clOrdId) return null;
     let fill = null;
-    try {
-      fill = await this.executor.getManagedOrderFill({
-        instrument: position.symbol || this.okx.instrument,
-        ordId,
-        clOrdId,
-        settings
-      });
-    } catch (error) {
-      logger.warn({
-        module: "tradeDaemon",
-        tradeId: position.id,
-        ordId,
-        clOrdId,
-        error: error.reason || error.message
-      }, "partial target sync failed");
-      return { inactive: true, error: error.reason || error.message };
+    if (isPaperExecution(settings)) {
+      const targetPrice = Number(payload.partialTargetPrice || payload.partialTarget?.price);
+      const current = Number(quote?.mid || quote?.last || position.price || position.entry);
+      const hit = Number.isFinite(targetPrice) && Number.isFinite(current)
+        && (position.direction === "LONG" ? current >= targetPrice : current <= targetPrice);
+      fill = hit
+        ? {
+          confirmed: true,
+          state: "filled",
+          ordId,
+          clOrdId,
+          fillPx: targetPrice,
+          accFillSz: Number(payload.partialTargetSize || Number(position.size || 0) / 2),
+          fee: 0,
+          feeCcy: "USDT",
+          raw: { paper: true, current }
+        }
+        : {
+          confirmed: false,
+          state: "live",
+          ordId,
+          clOrdId,
+          fillPx: null,
+          accFillSz: 0,
+          fee: 0,
+          feeCcy: "USDT",
+          raw: { paper: true, current }
+        };
+    } else {
+      try {
+        fill = await this.executor.getManagedOrderFill({
+          instrument: position.symbol || this.okx.instrument,
+          ordId,
+          clOrdId,
+          settings
+        });
+      } catch (error) {
+        logger.warn({
+          module: "tradeDaemon",
+          tradeId: position.id,
+          ordId,
+          clOrdId,
+          error: error.reason || error.message
+        }, "partial target sync failed");
+        return { inactive: true, error: error.reason || error.message };
+      }
     }
     if (!fill) return null;
     if (fill.confirmed) {
@@ -1017,8 +1249,24 @@ export class TradeDaemon {
   }
 
   async planPositionManagement({ position, market, settings, autoExecute }) {
+    if (isPaperExecution(settings) && shouldStopLoss(position, market.quote)) {
+      if (!autoExecute) {
+        return { action: "would_stop_loss_close", tradeId: position.id, reason: "paper_stop_loss", executed: false };
+      }
+      const result = await this.paperClosePosition(position.id, {
+        settings,
+        reason: "stop_loss",
+        exitPrice: position.stop || position.payload?.stop || quotePrice(market, position.price)
+      });
+      await this.safeNotify(() => this.notifier.notifyClose(settings, {
+        position,
+        pnl: result.pnl || 0,
+        reason: "stop_loss"
+      }));
+      return { action: "stop_loss_close", tradeId: position.id, result, executed: true };
+    }
     const partialTargetState = autoExecute
-      ? await this.syncPartialTargetOrder({ position, settings })
+      ? await this.syncPartialTargetOrder({ position, settings, quote: market.quote })
       : null;
     if (partialTargetState?.filled) {
       await this.safeNotify(() => this.notifier.notifyPartialTakeProfit(settings, {
@@ -1032,10 +1280,15 @@ export class TradeDaemon {
       if (!autoExecute) {
         return { action: "would_partial_tp", tradeId: position.id, reason: `${positionType(position)}_${partialTakeProfitR(position, settings)}R`, executed: false };
       }
-      const result = await this.executor.closeHalfPosition(position.id, {
-        storage: this.storage,
-        settings
-      });
+      const result = isPaperExecution(settings)
+        ? await this.paperCloseHalfPosition(position.id, {
+          settings,
+          exitPrice: quotePrice(market, position.payload?.partialTargetPrice || position.entry)
+        })
+        : await this.executor.closeHalfPosition(position.id, {
+          storage: this.storage,
+          settings
+        });
       await this.safeNotify(() => this.notifier.notifyPartialTakeProfit(settings, {
         position,
         pnl: 0,
@@ -1047,12 +1300,18 @@ export class TradeDaemon {
       if (!autoExecute) {
         return { action: "would_trailing_close", tradeId: position.id, reason: `MA${trailingPeriod(position, settings)}_H4_cross`, executed: false };
       }
-      const result = await this.executor.closePosition(position.id, {
-        storage: this.storage,
-        settings,
-        reason: "trailing_stop",
-        exitPrice: market.h4.at(-1)?.close
-      });
+      const result = isPaperExecution(settings)
+        ? await this.paperClosePosition(position.id, {
+          settings,
+          reason: "trailing_stop",
+          exitPrice: market.h4.at(-1)?.close || quotePrice(market, position.entry)
+        })
+        : await this.executor.closePosition(position.id, {
+          storage: this.storage,
+          settings,
+          reason: "trailing_stop",
+          exitPrice: market.h4.at(-1)?.close
+        });
       await this.safeNotify(() => this.notifier.notifyClose(settings, {
         position,
         pnl: result.pnl || 0,
@@ -1064,12 +1323,18 @@ export class TradeDaemon {
       if (!autoExecute) {
         return { action: "would_timeout_close", tradeId: position.id, reason: "max_hold_reached", executed: false };
       }
-      const result = await this.executor.closePosition(position.id, {
-        storage: this.storage,
-        settings,
-        reason: "timeout",
-        exitPrice: market.quote?.mid || position.price
-      });
+      const result = isPaperExecution(settings)
+        ? await this.paperClosePosition(position.id, {
+          settings,
+          reason: "timeout",
+          exitPrice: quotePrice(market, position.price)
+        })
+        : await this.executor.closePosition(position.id, {
+          storage: this.storage,
+          settings,
+          reason: "timeout",
+          exitPrice: market.quote?.mid || position.price
+        });
       await this.safeNotify(() => this.notifier.notifyClose(settings, {
         position,
         pnl: result.pnl || 0,

@@ -13,6 +13,7 @@ function bool(value) {
 }
 
 function normalizeMode(value) {
+  if (value === "paper" || value === "local") return "paper";
   return value === "live" || value === "real" ? "live" : "demo";
 }
 
@@ -137,7 +138,9 @@ export class OkxExecutor {
 
   status(settings = {}) {
     const mode = this.tradingMode(settings);
-    const guard = this.guard(settings);
+    const guard = mode === "paper"
+      ? { ok: true, reason: "local_paper_execution" }
+      : this.guard(settings);
     return {
       provider: "okx",
       mode,
@@ -152,6 +155,7 @@ export class OkxExecutor {
 
   guard(settings = {}) {
     const mode = this.tradingMode(settings);
+    if (mode === "paper") return { ok: false, reason: "paper_execution_does_not_use_okx_private_api" };
     if (settings?.api?.broker !== "okx") return { ok: false, reason: "broker_not_okx" };
     if (!this.isConfigured()) return { ok: false, reason: "okx_credentials_missing" };
     if (mode === "live" && !bool(process.env.TRADING_ENABLED)) {

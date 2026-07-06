@@ -12,7 +12,7 @@ export const defaultSettings = {
     realtimeProvider: "okx",
     backtestProvider: "oanda",
     broker: "okx",
-    tradeMode: "demo"
+    tradeMode: "paper"
   },
   paper: {
     initialBalanceUsdt: 10000
@@ -192,6 +192,7 @@ function normalizeSettings(settings) {
   if (settings?.api) {
     const allowedApiKeys = new Set(Object.keys(defaultSettings.api));
     settings.api = Object.fromEntries(Object.entries(settings.api).filter(([key]) => allowedApiKeys.has(key)));
+    if (settings.api.tradeMode === "demo") settings.api.tradeMode = "paper";
   }
   const lockedHours = settings?.risk?.noTradeUtcHours;
   if (Array.isArray(lockedHours)
