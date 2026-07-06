@@ -349,14 +349,16 @@ export class Storage {
     stop = null,
     signalGrade = "",
     signalId = "",
+    status = "open",
     payload = {}
   } = {}) {
     if (!this.enabled || !id) return false;
-    await this.db.query(
+    const result = await this.db.query(
       `INSERT INTO trades (
         id, opened_at, symbol, direction, type, entry, size, signal_grade, status, payload
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9::jsonb)
-      ON CONFLICT (id) DO NOTHING`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+      ON CONFLICT (id) DO NOTHING
+      RETURNING id`,
       [
         id,
         openedAt,
@@ -366,6 +368,7 @@ export class Storage {
         entry,
         size,
         signalGrade,
+        status,
         JSON.stringify({
           ...payload,
           signalId,
@@ -375,7 +378,7 @@ export class Storage {
         })
       ]
     );
-    return true;
+    return result.rowCount > 0;
   }
 
   async updateTrade(id, patch = {}) {
@@ -384,6 +387,8 @@ export class Storage {
     const values = [];
     const allowed = {
       closedAt: "closed_at",
+      openedAt: "opened_at",
+      entry: "entry",
       exit: "exit",
       size: "size",
       pnl: "pnl",
@@ -504,12 +509,16 @@ export class Storage {
     };
   }
 
-  async getDataHealthSnapshot() {
+  async getDataHealthSnapshot({ instruments = [] } = {}) {
     if (!this.enabled) return null;
+    const scoped = [...new Set(instruments.filter(Boolean))];
     const candles = await this.db.query(
-      `SELECT MAX(time) AS latest
+      `SELECT instrument, MAX(time) AS latest
        FROM candles
-       WHERE timeframe = 'H1' AND instrument LIKE 'XAU%'`
+       WHERE timeframe = 'H1'
+         AND (${scoped.length ? "instrument = ANY($1)" : "instrument LIKE 'XAU%'"})
+       GROUP BY instrument`,
+      scoped.length ? [scoped] : []
     );
     const macro = await this.db.query(
       `SELECT key, MAX(observed_at) AS latest
@@ -517,8 +526,14 @@ export class Storage {
        WHERE key IN ('tips', 'cot')
        GROUP BY key`
     );
+    const byInstrument = Object.fromEntries(candles.rows.map((row) => [
+      row.instrument,
+      row.latest instanceof Date ? row.latest.toISOString() : row.latest
+    ]));
+    const latest = Object.values(byInstrument).sort().at(-1) || null;
     return {
-      candlesH1Latest: candles.rows[0]?.latest instanceof Date ? candles.rows[0].latest.toISOString() : candles.rows[0]?.latest || null,
+      candlesH1Latest: latest,
+      candlesH1ByInstrument: byInstrument,
       macroLatest: Object.fromEntries(macro.rows.map((row) => [
         row.key,
         row.latest instanceof Date ? row.latest.toISOString() : row.latest
@@ -531,7 +546,7 @@ export class Storage {
     const result = await this.db.query(
       `SELECT *
        FROM trades
-       WHERE status <> 'open'
+       WHERE status NOT IN ('open', 'partial_closed', 'pending_open')
        ORDER BY COALESCE(closed_at, created_at) DESC
        LIMIT $1`,
       [limit]

@@ -29,6 +29,7 @@ services:
       NODE_ENV: production
       PORT: "4899"
       DATA_DIR: /data
+      XAU_ADMIN_TOKEN: ${XAU_ADMIN_TOKEN:-}
       TRADING_ENABLED: "false"
       OKX_API_BASE: ${OKX_API_BASE:-https://www.okx.com}
       OKX_LIVE_API_BASE: ${OKX_LIVE_API_BASE:-https://www.okx.com}

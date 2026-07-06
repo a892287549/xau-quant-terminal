@@ -40,6 +40,31 @@ function responseData(payload) {
   return payload?.data?.[0] || payload?.response || payload || {};
 }
 
+function orderIdentifier(payload = {}) {
+  const row = responseData(payload);
+  return {
+    ordId: row.ordId || payload.ordId || "",
+    clOrdId: row.clOrdId || payload.request?.clOrdId || payload.clOrdId || ""
+  };
+}
+
+function normalizeOrderFill(row = {}, fallback = {}) {
+  const fillPx = Number(row.avgPx || row.fillPx || row.px || fallback.fillPx || fallback.avgPx);
+  const accFillSz = Number(row.accFillSz || row.fillSz || fallback.accFillSz || fallback.fillSz || 0);
+  const state = String(row.state || fallback.state || "").toLowerCase();
+  return {
+    confirmed: state === "filled",
+    state,
+    ordId: row.ordId || fallback.ordId || "",
+    clOrdId: row.clOrdId || fallback.clOrdId || "",
+    fillPx: Number.isFinite(fillPx) ? fillPx : null,
+    accFillSz: Number.isFinite(accFillSz) ? accFillSz : 0,
+    fee: Number(row.fee || fallback.fee || 0),
+    feeCcy: row.feeCcy || fallback.feeCcy || "",
+    raw: row
+  };
+}
+
 class OkxExecutionError extends Error {
   constructor(message, { status = 400, retryable = false, retryAfterMs = 0, payload = null, reason = "" } = {}) {
     super(message);
@@ -144,10 +169,14 @@ export class OkxExecutor {
     return headers;
   }
 
-  async request(pathname, { method = "POST", body = {}, settings = {} } = {}) {
+  async request(pathname, { method = "POST", body = null, params = {}, settings = {} } = {}) {
     const url = new URL(`${this.apiBaseFor(settings)}${pathname}`);
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
+    });
     const requestPath = `${url.pathname}${url.search}`;
-    const bodyText = JSON.stringify(body);
+    const upperMethod = method.toUpperCase();
+    const bodyText = upperMethod === "GET" || body === null ? "" : JSON.stringify(body);
     const mode = this.tradingMode(settings);
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
@@ -176,7 +205,7 @@ export class OkxExecutor {
       const response = await fetch(url, {
         method,
         headers: this.headers({ timestamp, method, requestPath, bodyText, mode }),
-        body: bodyText,
+        body: bodyText || undefined,
         signal: controller.signal
       });
       const text = await response.text();
@@ -211,7 +240,17 @@ export class OkxExecutor {
     }
   }
 
-  buildPerpetualMarketOrder({ instrument = this.instrument, side, size, stopLossPrice, takeProfitPrice, tdMode = "cross", clientOrderId } = {}) {
+  buildPerpetualMarketOrder({
+    instrument = this.instrument,
+    side,
+    size,
+    stopLossPrice,
+    takeProfitPrice,
+    tdMode = "cross",
+    clientOrderId,
+    reduceOnly = false,
+    posSide = ""
+  } = {}) {
     if (!["buy", "sell"].includes(side)) {
       throw new OkxExecutionError("OKX order side must be buy or sell", { reason: "invalid_side" });
     }
@@ -227,6 +266,8 @@ export class OkxExecutor {
       sz: String(size),
       clOrdId
     };
+    if (reduceOnly) body.reduceOnly = "true";
+    if (posSide) body.posSide = posSide;
     if (stopLossPrice) {
       const stop = {
         attachAlgoClOrdId: compactId("sl"),
@@ -242,7 +283,52 @@ export class OkxExecutor {
     return body;
   }
 
-  async placePerpetualMarketOrder(input = {}, settings = {}) {
+  async getOrderDetails({ instrument = this.instrument, ordId = "", clOrdId = "", settings = {} } = {}) {
+    if (!ordId && !clOrdId) return null;
+    const payload = await this.request("/api/v5/trade/order", {
+      method: "GET",
+      params: {
+        instId: instrument,
+        ordId,
+        clOrdId
+      },
+      settings
+    });
+    return responseData(payload);
+  }
+
+  async waitForOrderFill(order, { instrument = this.instrument, settings = {}, timeoutMs = 12000, pollMs = 600 } = {}) {
+    const ids = orderIdentifier(order);
+    const fallback = responseData(order);
+    if (!ids.ordId && !ids.clOrdId) return normalizeOrderFill(fallback);
+    const started = Date.now();
+    let last = fallback;
+    while (Date.now() - started <= timeoutMs) {
+      const details = await this.getOrderDetails({
+        instrument,
+        ordId: ids.ordId,
+        clOrdId: ids.clOrdId,
+        settings
+      });
+      if (details) last = details;
+      const fill = normalizeOrderFill(last, fallback);
+      if (fill.confirmed) return fill;
+      if (["canceled", "rejected"].includes(fill.state)) {
+        throw new OkxExecutionError(`OKX order ${fill.state}`, {
+          reason: `order_${fill.state}`,
+          payload: last
+        });
+      }
+      await sleep(pollMs);
+    }
+    return {
+      ...normalizeOrderFill(last, fallback),
+      confirmed: false,
+      timedOut: true
+    };
+  }
+
+  async placePerpetualMarketOrder(input = {}, settings = {}, options = {}) {
     const guard = this.guard(settings);
     if (!guard.ok) {
       throw new OkxExecutionError("OKX order submission is disabled", {
@@ -256,10 +342,28 @@ export class OkxExecutor {
       body,
       settings
     });
-    return {
+    const response = payload.data?.[0] || payload;
+    const result = {
       mode: this.tradingMode(settings),
       request: body,
-      response: payload.data?.[0] || payload
+      response
+    };
+    if (options.confirmFill !== false) {
+      const fill = await this.waitForOrderFill(result, {
+        instrument: body.instId,
+        settings,
+        timeoutMs: options.timeoutMs
+      });
+      if (!fill.confirmed) {
+        throw new OkxExecutionError("OKX order was accepted but fill was not confirmed", {
+          reason: "fill_not_confirmed",
+          payload: { order: result, fill }
+        });
+      }
+      result.fill = fill;
+    }
+    return {
+      ...result
     };
   }
 
@@ -276,9 +380,10 @@ export class OkxExecutor {
       instrument: trade.symbol || this.instrument,
       side: closeSide(trade.direction),
       size,
-      clientOrderId: compactId("cls")
+      clientOrderId: compactId("cls"),
+      reduceOnly: true
     }, settings);
-    const fill = Number(responseData(order).fillPx || responseData(order).avgPx || exitPrice || trade.exit || trade.entry);
+    const fill = Number(order.fill?.fillPx || responseData(order).fillPx || responseData(order).avgPx || exitPrice || trade.exit || trade.entry);
     const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || 100);
     const pnl = Number.isFinite(fill)
       ? (fill - Number(trade.entry)) * directionSign(trade.direction) * Number(trade.size || 0) * pnlMultiplier
@@ -297,6 +402,24 @@ export class OkxExecutor {
           ...((trade.payload || {}).events || []),
           { at: new Date().toISOString(), type: "closed", reason, order }
         ]
+      }
+    });
+    await storage.recordExecutionAudit?.({
+      tradeId: positionId,
+      signalEntry: trade.entry,
+      actualFill: null,
+      slippagePct: null,
+      expectedStop: trade.payload?.stop || null,
+      actualStopOrderId: order.response?.ordId || order.response?.clOrdId || "",
+      stopFillPrice: Number.isFinite(fill) ? fill : null,
+      stopSlippagePct: Number.isFinite(fill) && trade.payload?.stop
+        ? ((fill - Number(trade.payload.stop)) / Number(trade.payload.stop)) * 100 * directionSign(trade.direction)
+        : null,
+      fee: order.fill?.fee || 0,
+      feeAsset: order.fill?.feeCcy || "USDT",
+      payload: {
+        reason,
+        order
       }
     });
     return {
@@ -327,7 +450,8 @@ export class OkxExecutor {
       instrument: trade.symbol || this.instrument,
       side: closeSide(trade.direction),
       size,
-      clientOrderId: compactId("ptp")
+      clientOrderId: compactId("ptp"),
+      reduceOnly: true
     }, settings);
     await storage.updateTrade(positionId, {
       size: remainingSize,
@@ -341,6 +465,24 @@ export class OkxExecutor {
           ...((trade.payload || {}).events || []),
           { at: new Date().toISOString(), type: "partial_tp", sizeClosed: size, remainingSize, order }
         ]
+      }
+    });
+    await storage.recordExecutionAudit?.({
+      tradeId: positionId,
+      signalEntry: trade.entry,
+      actualFill: order.fill?.fillPx || null,
+      slippagePct: null,
+      expectedStop: trade.payload?.stop || null,
+      actualStopOrderId: order.response?.ordId || order.response?.clOrdId || "",
+      stopFillPrice: null,
+      stopSlippagePct: null,
+      fee: order.fill?.fee || 0,
+      feeAsset: order.fill?.feeCcy || "USDT",
+      payload: {
+        reason: "partial_take_profit",
+        sizeClosed: size,
+        remainingSize,
+        order
       }
     });
     return {
@@ -369,7 +511,8 @@ export class OkxExecutor {
       ordType: "conditional",
       sz: String(roundLot(size)),
       slTriggerPx: String(stopPrice),
-      slOrdPx: "-1"
+      slOrdPx: "-1",
+      reduceOnly: "true"
     };
     const payload = await this.request("/api/v5/trade/order-algo", {
       method: "POST",

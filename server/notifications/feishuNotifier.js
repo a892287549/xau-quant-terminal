@@ -77,10 +77,10 @@ export class FeishuNotifier {
     );
   }
 
-  notifyPartialTakeProfit(settings, { position, pnl = 0 }) {
+  notifyPartialTakeProfit(settings, { position, pnl = 0, label = "1.5R" }) {
     return this.send(
       settings,
-      `💰 **半仓锁利** ${position.type || position.signalType || ""} ${money(pnl)} @1.5R`,
+      `💰 **半仓锁利** ${position.type || position.signalType || ""} ${money(pnl)} @${label}`,
       "XAU 半仓止盈"
     );
   }

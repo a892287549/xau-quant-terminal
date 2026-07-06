@@ -59,13 +59,22 @@ export class DataHealthMonitor {
   }
 
   async checkOnce() {
-    const snapshot = await this.storage?.getDataHealthSnapshot?.();
     const settings = await this.getSettings?.();
+    const okxInstrument = this.okx?.instrument;
+    const oandaInstrument = process.env.OANDA_INSTRUMENT || "XAU_USD";
+    const snapshot = await this.storage?.getDataHealthSnapshot?.({
+      instruments: [okxInstrument, oandaInstrument]
+    });
     const issues = [];
-    const candleAge = ageHours(snapshot?.candlesH1Latest);
+    const okxLatest = snapshot?.candlesH1ByInstrument?.[okxInstrument] || null;
+    const oandaLatest = snapshot?.candlesH1ByInstrument?.[oandaInstrument] || null;
+    const candleLatest = okxLatest || snapshot?.candlesH1Latest;
+    const candleAge = ageHours(candleLatest);
+    const oandaAge = ageHours(oandaLatest);
     const tipsAge = ageHours(snapshot?.macroLatest?.tips);
     const cotAge = ageHours(snapshot?.macroLatest?.cot);
-    if (candleAge > 2) issues.push(issue("candles H1", candleAge, 2, snapshot?.candlesH1Latest));
+    if (settings?.api?.dataProvider === "okx" && candleAge > 2) issues.push(issue(`OKX ${okxInstrument} H1`, candleAge, 2, candleLatest));
+    if (settings?.api?.backtestProvider === "oanda" && oandaAge > 96) issues.push(issue(`OANDA ${oandaInstrument} H1`, oandaAge, 96, oandaLatest));
     if (tipsAge > 24) issues.push(issue("TIPS", tipsAge, 24, snapshot?.macroLatest?.tips));
     if (cotAge > 8 * 24) issues.push(issue("COT", cotAge, 8 * 24, snapshot?.macroLatest?.cot));
     this.lastCheck = new Date().toISOString();

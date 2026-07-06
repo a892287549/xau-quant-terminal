@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server/index.mjs",
     "smoke": "node server/index.mjs --smoke",
-    "experiment:matrix": "node server/scripts/runExperimentMatrix.mjs"
+    "experiment:matrix": "node server/scripts/runExperimentMatrix.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=22"

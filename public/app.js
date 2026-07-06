@@ -45,6 +45,7 @@ let tradeRefreshTimer = null;
 let tradeRefreshInFlight = false;
 let wsClient = null;
 let wsReconnectTimer = null;
+const ADMIN_TOKEN_KEY = "xauAdminToken";
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -54,6 +55,20 @@ function esc(value) {
     "\"": "&quot;",
     "'": "&#39;"
   })[char]);
+}
+
+function adminToken() {
+  return localStorage.getItem(ADMIN_TOKEN_KEY) || sessionStorage.getItem(ADMIN_TOKEN_KEY) || "";
+}
+
+function setAdminToken(value) {
+  const token = String(value || "").trim();
+  if (token) {
+    localStorage.setItem(ADMIN_TOKEN_KEY, token);
+  } else {
+    localStorage.removeItem(ADMIN_TOKEN_KEY);
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+  }
 }
 
 function fmt(value, suffix = "") {
@@ -104,15 +119,20 @@ function localizeDirectionText(value) {
 }
 
 async function api(path, options = {}) {
+  const token = adminToken();
   const response = await fetch(`${apiBase}${path}`, {
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(options.headers || {})
     },
     ...options
   });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.message || payload.error || `${response.status} ${response.statusText}`);
+  }
   return response.json();
 }
 
@@ -133,8 +153,10 @@ async function loadData() {
 
 function connectRealtime() {
   if (wsClient || wsReconnectTimer) return;
+  if (!adminToken()) return;
   const protocol = location.protocol === "https:" ? "wss" : "ws";
-  const path = `${apiBase || ""}/ws`;
+  const token = adminToken();
+  const path = `${apiBase || ""}/ws${token ? `?adminToken=${encodeURIComponent(token)}` : ""}`;
   wsClient = new WebSocket(`${protocol}://${location.host}${path}`);
   wsClient.onmessage = (event) => {
     const message = JSON.parse(event.data || "{}");
@@ -1227,9 +1249,20 @@ function renderSettings() {
   const payload = state.data.settings;
   const settings = payload.settings;
   const deployment = payload.deployment;
+  const security = payload.security || {};
   const executionAudit = payload.executionAudit || [];
   return `
     <form id="settingsForm" class="grid">
+      <section class="panel span-6">
+        <h2>访问控制</h2>
+        <div class="form-grid">
+          <label>本机管理令牌<input data-admin-token type="password" value="${esc(adminToken())}" placeholder="${security.adminTokenConfigured ? "已启用，填入后可保存配置" : "服务器未配置 XAU_ADMIN_TOKEN"}"></label>
+          <button class="primary" type="button" id="saveAdminToken">保存令牌</button>
+          <label>写接口保护<input value="${security.protectedWrites ? "已开启" : "未开启"}" disabled></label>
+          <label>当前权限<input value="${security.admin ? "管理员" : "只读"}" disabled></label>
+        </div>
+      </section>
+
       <section class="panel span-6">
         <h2>API 配置</h2>
         <div class="form-grid">
@@ -1260,7 +1293,17 @@ function renderSettings() {
         <div class="form-grid">
           ${toggle("daemon.enabled", "启用自动扫描", settings.daemon?.enabled ?? true)}
           ${toggle("daemon.autoExecute", "自动执行下单", settings.daemon?.autoExecute ?? false)}
+          ${toggle("daemon.useFixedOrderSize", "使用固定下单手数", settings.daemon?.useFixedOrderSize ?? false)}
           <label>扫描间隔（分钟）<input name="daemon.scanIntervalMinutes" type="number" step="1" min="1" value="${settings.daemon?.scanIntervalMinutes ?? 5}"></label>
+          <label>固定手数<input name="daemon.orderSize" type="number" step="0.01" min="0.01" value="${settings.daemon?.orderSize ?? 0.01}"></label>
+          <label>最小下单单位<input name="daemon.minOrderSize" type="number" step="0.01" min="0.01" value="${settings.daemon?.minOrderSize ?? 0.01}"></label>
+          <label>PnL/合约乘数<input name="daemon.pnlMultiplier" type="number" step="1" min="1" value="${settings.daemon?.pnlMultiplier ?? 100}"></label>
+          ${toggle("daemon.eventCalendar.enabled", "自动经济日历", settings.daemon?.eventCalendar?.enabled ?? true)}
+          ${toggle("daemon.eventCalendar.sources.fomc", "FOMC 熔断", settings.daemon?.eventCalendar?.sources?.fomc ?? true)}
+          ${toggle("daemon.eventCalendar.sources.nfp", "NFP 熔断", settings.daemon?.eventCalendar?.sources?.nfp ?? true)}
+          <label>事件前保护分钟<input name="daemon.eventCalendar.beforeMinutes" type="number" step="1" min="0" value="${settings.daemon?.eventCalendar?.beforeMinutes ?? 30}"></label>
+          <label>事件后保护分钟<input name="daemon.eventCalendar.afterMinutes" type="number" step="1" min="0" value="${settings.daemon?.eventCalendar?.afterMinutes ?? 30}"></label>
+          <label>日历刷新小时<input name="daemon.eventCalendar.refreshIntervalHours" type="number" step="1" min="1" value="${settings.daemon?.eventCalendar?.refreshIntervalHours ?? 12}"></label>
         </div>
       </section>
 
@@ -1524,27 +1567,63 @@ function bindPageEvents() {
     render();
   }));
   $("#exportTrades")?.addEventListener("click", () => {
-    location.href = `${apiBase}/api/export/trades.csv`;
+    exportTradesCsv().catch((error) => toast(error.message));
   });
   $("#backtestForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    state.backtestResult = await api("/api/backtests/run", {
-      method: "POST",
-      body: JSON.stringify(formToObject(event.currentTarget))
-    });
-    toast("回测完成");
-    render();
+    try {
+      state.backtestResult = await api("/api/backtests/run", {
+        method: "POST",
+        body: JSON.stringify(formToObject(event.currentTarget))
+      });
+      toast("回测完成");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
   });
   $("#settingsForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const result = await api("/api/settings", {
-      method: "PUT",
-      body: JSON.stringify(formToObject(event.currentTarget))
-    });
-    state.data.settings.settings = result.settings;
-    toast("配置已保存");
-    render();
+    try {
+      const result = await api("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify(formToObject(event.currentTarget))
+      });
+      state.data.settings.settings = result.settings;
+      toast("配置已保存");
+      render();
+    } catch (error) {
+      toast(error.message);
+    }
   });
+  $("#saveAdminToken")?.addEventListener("click", () => {
+    setAdminToken($("[data-admin-token]")?.value || "");
+    if (wsClient) wsClient.close();
+    toast("管理令牌已保存到本机");
+    loadData().then(render).catch((error) => toast(error.message));
+  });
+}
+
+async function exportTradesCsv() {
+  const token = adminToken();
+  const response = await fetch(`${apiBase}/api/export/trades.csv`, {
+    cache: "no-store",
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    }
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.message || payload.error || "导出失败");
+  }
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "xau-trades.csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
 }
 
 function toast(message) {

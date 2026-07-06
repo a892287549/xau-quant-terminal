@@ -15,10 +15,18 @@ import { TradeDaemon } from "./daemon/tradeDaemon.js";
 import { FeishuNotifier } from "./notifications/feishuNotifier.js";
 import { WsHub } from "./realtime/wsHub.js";
 import { DataHealthMonitor } from "./monitor/dataHealth.js";
+import { EventCalendar } from "./monitor/eventCalendar.js";
 import { logger } from "./logger.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
+import {
+  authStatus,
+  isAdminRequest,
+  isProtectedApiRoute,
+  protectAdminRoute,
+  sanitizeSettings
+} from "./security/auth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -35,6 +43,7 @@ const okxExecutor = new OkxExecutor();
 const macroFetcher = new MacroFetcher({ dataDir, storage });
 const feishuNotifier = new FeishuNotifier();
 const wsHub = new WsHub();
+const eventCalendar = new EventCalendar({ storage });
 const dataHealthMonitor = new DataHealthMonitor({
   storage,
   notifier: feishuNotifier,
@@ -50,7 +59,8 @@ const tradeDaemon = new TradeDaemon({
   storage,
   notifier: feishuNotifier,
   broadcaster: wsHub,
-  dataHealthMonitor
+  dataHealthMonitor,
+  eventCalendar
 });
 
 const mimeTypes = {
@@ -119,6 +129,8 @@ async function handleApi(req, res, url) {
   const savedSettings = await settingsStore.read();
   const settings = runtimeSettings(savedSettings);
   const pathname = url.pathname;
+  const admin = isAdminRequest(req, url);
+  if (isProtectedApiRoute(req.method, pathname) && !protectAdminRoute(req, res, json)) return;
   if (req.method === "GET" && pathname === "/api/health") {
     return json(res, {
       ok: true,
@@ -132,6 +144,7 @@ async function handleApi(req, res, url) {
       daemon: tradeDaemon.status(),
       websocket: wsHub.status(),
       dataHealth: dataHealthMonitor.status(),
+      eventCalendar: eventCalendar.status(),
       dataSource: {
         mode: settings.api.dataMode,
         provider: settings.api.dataProvider,
@@ -147,6 +160,7 @@ async function handleApi(req, res, url) {
       database: {
         enabled: storage.enabled
       },
+      security: authStatus(),
       deployment: deploymentInfo(startedAt)
     });
   }
@@ -209,16 +223,20 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "GET" && pathname === "/api/settings") {
     return json(res, {
-      settings,
+      settings: sanitizeSettings(settings, { admin }),
+      security: {
+        ...authStatus(),
+        admin
+      },
       deployment: deploymentInfo(startedAt),
-      executionAudit: await storage.getExecutionAudit?.(20) || [],
-      logs: dataProvider.logs()
+      executionAudit: admin ? await storage.getExecutionAudit?.(20) || [] : [],
+      logs: admin ? dataProvider.logs() : []
     });
   }
   if (req.method === "PUT" && pathname === "/api/settings") {
     const input = await readBody(req);
     const next = await settingsStore.write(input);
-    return json(res, { ok: true, settings: runtimeSettings(next) });
+    return json(res, { ok: true, settings: sanitizeSettings(runtimeSettings(next), { admin: true }) });
   }
   if (req.method === "GET" && pathname === "/api/logs") {
     return json(res, { logs: logs() });
@@ -260,6 +278,11 @@ server.on("upgrade", (req, socket, head) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     if (url.pathname === "/ws" || url.pathname === "/quant/ws") {
+      if (!isAdminRequest(req, url)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       wsHub.handleUpgrade(req, socket, head);
       return;
     }

@@ -20,7 +20,22 @@ export const defaultSettings = {
   daemon: {
     enabled: true,
     scanIntervalMinutes: 5,
-    autoExecute: false
+    autoExecute: false,
+    useFixedOrderSize: false,
+    orderSize: 0.01,
+    minOrderSize: 0.01,
+    pnlMultiplier: 100,
+    eventWindows: [],
+    eventCalendar: {
+      enabled: true,
+      refreshIntervalHours: 12,
+      beforeMinutes: 30,
+      afterMinutes: 30,
+      sources: {
+        fomc: true,
+        nfp: true
+      }
+    }
   },
   notifications: {
     feishu: {
@@ -57,7 +72,7 @@ export const defaultSettings = {
     supportReversalFailureBars: 3,
     supportReversalFailureAtr: 0.2,
     supportReversalOneRTimeoutBars: 24,
-    supportReversalTp1R: 1.5,
+    supportReversalTp1R: 2,
     structuralBreakdownPositionFactor: 0.5,
     adaptiveLeverage: false,
     signalRiskMultipliers: {
@@ -85,7 +100,7 @@ export const defaultSettings = {
     weeklyDrawdownPausePct: 15,
     weeklyDrawdownReducedRiskPct: 1,
     eventCircuitBreaker: true,
-    noTradeUtcHours: [0, 1, 2, 3, 4, 5, 6],
+    noTradeUtcHours: [0, 1, 2, 3, 4, 5, 6, 7],
     weeklyDrawdownAction: "half_position"
   },
   strategy: {
@@ -178,6 +193,13 @@ function normalizeSettings(settings) {
     const allowedApiKeys = new Set(Object.keys(defaultSettings.api));
     settings.api = Object.fromEntries(Object.entries(settings.api).filter(([key]) => allowedApiKeys.has(key)));
   }
+  const lockedHours = settings?.risk?.noTradeUtcHours;
+  if (Array.isArray(lockedHours)
+    && lockedHours.length === 7
+    && [0, 1, 2, 3, 4, 5, 6].every((hour) => lockedHours.includes(hour))) {
+    settings.risk.noTradeUtcHours = [...lockedHours, 7];
+  }
+  if (settings?.risk?.supportReversalTp1R === 1.5) settings.risk.supportReversalTp1R = 2;
   return settings;
 }
 

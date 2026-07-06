@@ -8,6 +8,12 @@ function round(value, digits = 2) {
   return Number(Number(value).toFixed(digits));
 }
 
+function floorLot(value, step = 0.01) {
+  const unit = Number(step || 0.01);
+  if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(unit) || unit <= 0) return 0;
+  return Math.floor(value / unit) * unit;
+}
+
 function compactId(prefix, value = Date.now()) {
   return `${prefix}-${String(value).replace(/[^a-zA-Z0-9]/g, "").slice(-18)}-${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -83,6 +89,21 @@ function weeklyLossPct(history = [], initialBalance = 10000) {
   return round(Math.max(0, -pnl) / Math.max(1, initialBalance) * 100);
 }
 
+function realizedPnl(history = []) {
+  return history
+    .filter((trade) => trade.closedAt)
+    .reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+}
+
+function gradeRiskMultiplier(grade) {
+  return {
+    S: 1.5,
+    A: 1,
+    B: 0.5,
+    C: 0.25
+  }[String(grade || "B").toUpperCase()] || 0.5;
+}
+
 function maxDrawdownPctFromTrades(history = [], initialBalance = 10000) {
   let equity = initialBalance;
   let peak = initialBalance;
@@ -104,18 +125,21 @@ function dailyStopCount(history = []) {
   return history.filter((trade) => trade.closedAt && new Date(trade.closedAt) >= today && isStopLossTrade(trade)).length;
 }
 
-function inEventWindow(settings = {}, now = new Date()) {
+function inEventWindow(settings = {}, now = new Date(), eventSnapshot = null) {
   if (!settings?.risk?.eventCircuitBreaker) return false;
+  if (eventSnapshot?.active) return eventSnapshot.active;
   const windows = settings?.daemon?.eventWindows || [];
-  return windows.some((item) => {
+  return windows.find((item) => {
     const eventAt = new Date(item.at || item.time || item);
-    if (Number.isNaN(eventAt.getTime())) return false;
+    if (Number.isNaN(eventAt.getTime())) return null;
     return Math.abs(eventAt.getTime() - now.getTime()) <= 30 * 60 * 1000;
-  });
+  }) || null;
 }
 
-function buildRiskSnapshot(settings = {}, history = []) {
+export function buildRiskSnapshot(settings = {}, history = [], eventSnapshot = null) {
   const initialBalance = Number(settings?.paper?.initialBalanceUsdt || 10000);
+  const closedPnl = realizedPnl(history);
+  const equity = initialBalance + closedPnl;
   const stoppedOutToday = dailyStopCount(history);
   const weeklyDrawdownPct = weeklyLossPct(history, initialBalance);
   const maxDailyStops = Number(settings?.risk?.maxDailyStops || 2);
@@ -123,12 +147,13 @@ function buildRiskSnapshot(settings = {}, history = []) {
   const utcHour = new Date().getUTCHours();
   const lockedHours = settings?.risk?.noTradeUtcHours || [0, 1, 2, 3, 4, 5, 6, 7];
   const sessionLocked = lockedHours.includes(utcHour);
-  const eventLocked = inEventWindow(settings);
+  const eventWindow = inEventWindow(settings, new Date(), eventSnapshot);
+  const eventLocked = Boolean(eventWindow);
   const reasons = [];
   if (stoppedOutToday >= maxDailyStops) reasons.push(`daily_stops_${stoppedOutToday}/${maxDailyStops}`);
   if (weeklyDrawdownPct >= weeklyPausePct) reasons.push(`weekly_drawdown_${weeklyDrawdownPct}%`);
   if (sessionLocked) reasons.push(`utc_hour_locked_${utcHour}`);
-  if (eventLocked) reasons.push("event_window");
+  if (eventLocked) reasons.push(`event_window_${eventWindow.code || eventWindow.name || "manual"}`);
   return {
     canOpen: reasons.length === 0,
     reasons,
@@ -137,13 +162,38 @@ function buildRiskSnapshot(settings = {}, history = []) {
     weeklyDrawdownPct,
     weeklyPausePct,
     sessionLocked,
-    eventLocked
+    eventLocked,
+    eventWindow,
+    eventCalendar: {
+      enabled: eventSnapshot?.enabled ?? null,
+      fetchedAt: eventSnapshot?.fetchedAt || null,
+      lastError: eventSnapshot?.lastError || "",
+      events: eventSnapshot?.events?.length || 0
+    },
+    initialBalance,
+    realizedPnl: round(closedPnl),
+    equity: round(equity)
   };
 }
 
-function orderSizeFor(settings = {}) {
-  const raw = Number(settings?.daemon?.orderSize || process.env.OKX_DEFAULT_ORDER_SIZE || 0.01);
-  return Math.max(0.01, Math.floor(raw * 100) / 100).toFixed(2);
+export function orderSizeFor(settings = {}, signal = {}, risk = {}) {
+  if (settings?.daemon?.useFixedOrderSize && settings?.daemon?.orderSize) {
+    const raw = Number(settings.daemon.orderSize || process.env.OKX_DEFAULT_ORDER_SIZE || 0.01);
+    return Math.max(0.01, Math.floor(raw * 100) / 100).toFixed(2);
+  }
+  const entry = Number(signal.entry);
+  const stop = Number(signal.stop);
+  const stopDistance = Math.abs(entry - stop);
+  const equity = Number(risk.equity || settings?.paper?.initialBalanceUsdt || 10000);
+  const riskPct = Number(settings?.risk?.perTradeRiskPct || 2) / 100;
+  const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+  const minOrderSize = Number(settings?.daemon?.minOrderSize || process.env.OKX_MIN_ORDER_SIZE || 0.01);
+  if (!Number.isFinite(entry) || !Number.isFinite(stop) || stopDistance <= 0 || equity <= 0) {
+    return Math.max(minOrderSize, floorLot(Number(process.env.OKX_DEFAULT_ORDER_SIZE || 0.01), minOrderSize)).toFixed(2);
+  }
+  const riskAmount = equity * riskPct * gradeRiskMultiplier(signal.grade);
+  const raw = riskAmount / Math.max(0.01, stopDistance * pnlMultiplier);
+  return Math.max(minOrderSize, floorLot(raw, minOrderSize)).toFixed(2);
 }
 
 function tradeTypeStats(history = []) {
@@ -183,19 +233,19 @@ function orderResponse(order = {}) {
 
 function fillPriceFromOrder(order, fallback) {
   const response = orderResponse(order);
-  const parsed = Number(response.fillPx || response.avgPx || response.px || fallback);
+  const parsed = Number(order?.fill?.fillPx || response.fillPx || response.avgPx || response.px || fallback);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
 function feeFromOrder(order) {
   const response = orderResponse(order);
-  const fee = Number(response.fee || response.fillFee || 0);
+  const fee = Number(order?.fill?.fee || response.fee || response.fillFee || 0);
   return Number.isFinite(fee) ? fee : 0;
 }
 
 function feeAssetFromOrder(order) {
   const response = orderResponse(order);
-  return response.feeCcy || response.fillFeeCcy || "USDT";
+  return order?.fill?.feeCcy || response.feeCcy || response.fillFeeCcy || "USDT";
 }
 
 function slippagePct(expected, actual, direction) {
@@ -210,20 +260,37 @@ function stopOrderIdFromOrder(order) {
   return response.algoId || response.ordId || response.clOrdId || "";
 }
 
-function shouldPartialTakeProfit(position, quote) {
-  if (positionType(position) !== "fakeout" || hasPartialTakeProfit(position)) return false;
+function partialTakeProfitR(position, settings = {}) {
+  const type = positionType(position);
+  if (type === "fakeout") return Number(settings?.strategy?.exitRules?.fakeoutTp1R || 1.5);
+  if (type === "support_reversal") return Number(settings?.risk?.supportReversalTp1R || 2);
+  return 0;
+}
+
+function shouldPartialTakeProfit(position, quote, settings = {}) {
+  const takeProfitR = partialTakeProfitR(position, settings);
+  if (!takeProfitR || hasPartialTakeProfit(position)) return false;
   const entry = Number(position.entry);
   const stop = Number(position.stop || position.payload?.stop);
   const current = Number(quote?.mid || position.price || entry);
   if (!entry || !stop || !current) return false;
   const r = Math.abs(entry - stop);
   const move = (current - entry) * directionSign(position.direction);
-  return r > 0 && move >= r * 1.5;
+  return r > 0 && move >= r * takeProfitR;
 }
 
-function shouldTrailingClose(position, h4Candles = []) {
-  if (positionType(position) !== "fakeout" || !hasPartialTakeProfit(position)) return false;
-  const line = ma(h4Candles, 10);
+function trailingPeriod(position, settings = {}) {
+  const type = positionType(position);
+  if (type === "fakeout") return Number(settings?.strategy?.exitRules?.fakeoutTrailingMaPeriod || 10);
+  if (type === "support_reversal") return 20;
+  return 0;
+}
+
+function shouldTrailingClose(position, h4Candles = [], settings = {}) {
+  if (!hasPartialTakeProfit(position)) return false;
+  const period = trailingPeriod(position, settings);
+  if (!period) return false;
+  const line = ma(h4Candles, period);
   const close = Number(h4Candles.at(-1)?.close);
   if (!line || !close) return false;
   return position.direction === "LONG" ? close < line : close > line;
@@ -244,7 +311,8 @@ export class TradeDaemon {
     storage,
     notifier = null,
     broadcaster = null,
-    dataHealthMonitor = null
+    dataHealthMonitor = null,
+    eventCalendar = null
   }) {
     this.getSettings = getSettings;
     this.okx = okxAdapter;
@@ -254,6 +322,7 @@ export class TradeDaemon {
     this.notifier = notifier;
     this.broadcaster = broadcaster;
     this.dataHealthMonitor = dataHealthMonitor;
+    this.eventCalendar = eventCalendar;
     this.timer = null;
     this.running = false;
     this.lastScan = null;
@@ -340,7 +409,8 @@ export class TradeDaemon {
       const signals = engine.signals.filter(isExecutableSignal);
       const openPositions = await this.storage?.getOpenTradePositions?.(50) || [];
       const history = await this.storage?.getTradeHistory?.(500) || [];
-      const risk = buildRiskSnapshot(settings, history);
+      const eventSnapshot = await this.eventCalendar?.getSnapshot?.(settings);
+      const risk = buildRiskSnapshot(settings, history, eventSnapshot);
       const actions = [];
       let executed = 0;
 
@@ -357,7 +427,6 @@ export class TradeDaemon {
       }
 
       for (const signal of signals) {
-        await this.notifySignalOnce(settings, signal);
         const action = await this.planSignalExecution({
           signal,
           openPositions,
@@ -365,6 +434,9 @@ export class TradeDaemon {
           settings,
           autoExecute
         });
+        if (["would_open", "opened", "would_close_reverse_then_open"].includes(action.action)) {
+          await this.notifySignalOnce(settings, signal);
+        }
         actions.push(action);
         if (action.executed) executed += 1;
       }
@@ -595,7 +667,14 @@ export class TradeDaemon {
         type: signal.type,
         entry: signal.entry,
         stop: signal.stop,
-        size: orderSizeFor(settings),
+        size: orderSizeFor(settings, signal, risk),
+        executed: false
+      };
+    }
+    if (!this.storage?.enabled) {
+      return {
+        action: "skip_storage_missing",
+        signalId: signal.id,
         executed: false
       };
     }
@@ -618,65 +697,126 @@ export class TradeDaemon {
         executed: false
       };
     }
-    if (opposite) {
-      await this.executor.placePerpetualMarketOrder({
-        side: closeSideForDirection(opposite.direction),
-        size: opposite.size,
-        clientOrderId: compactId("rev")
-      }, settings);
-      await this.storage.appendTradeEvent(opposite.id, { type: "reverse_close_requested", signalId: signal.id });
-    }
-    const order = await this.executor.placePerpetualMarketOrder({
-      side: sideForDirection(signal.direction),
-      size: orderSizeFor(settings),
-      stopLossPrice: signal.stop,
-      clientOrderId: compactId("open")
-    }, settings);
+    const size = orderSizeFor(settings, signal, risk);
     const tradeId = candidateTradeId(signal);
-    await this.storage.createOpenTrade({
+    const inserted = await this.storage.createOpenTrade({
       id: tradeId,
       symbol: this.okx.instrument,
       direction: signal.direction,
       type: signal.type,
       entry: signal.entry,
-      size: orderSizeFor(settings),
+      size,
       stop: signal.stop,
       signalGrade: signal.grade,
       signalId: signal.id,
-      payload: { signal, order }
+      status: "pending_open",
+      payload: {
+        signal,
+        risk,
+        requestedSize: size,
+        events: [{ at: new Date().toISOString(), type: "pending_open", signalId: signal.id }]
+      }
     });
-    const actualFill = fillPriceFromOrder(order, signal.entry);
-    await this.storage.recordExecutionAudit?.({
-      tradeId,
-      signalEntry: signal.entry,
-      actualFill,
-      slippagePct: slippagePct(signal.entry, actualFill, signal.direction),
-      expectedStop: signal.stop,
-      actualStopOrderId: stopOrderIdFromOrder(order),
-      stopFillPrice: null,
-      stopSlippagePct: null,
-      fee: feeFromOrder(order),
-      feeAsset: feeAssetFromOrder(order),
-      payload: { signalId: signal.id, order }
-    });
-    await this.safeNotify(() => this.notifier.notifyOpen(settings, {
-      signal,
-      size: orderSizeFor(settings),
-      entry: signal.entry,
-      stop: signal.stop
-    }));
-    return {
-      action: "opened",
-      signalId: signal.id,
-      tradeId,
-      executed: true
-    };
+    if (!inserted) {
+      return {
+        action: "skip_duplicate_signal",
+        signalId: signal.id,
+        tradeId,
+        executed: false
+      };
+    }
+    try {
+      if (opposite) {
+        await this.executor.closePosition(opposite.id, {
+          storage: this.storage,
+          settings,
+          reason: "reverse_signal",
+          exitPrice: signal.entry
+        });
+      }
+      const order = await this.executor.placePerpetualMarketOrder({
+        side: sideForDirection(signal.direction),
+        size,
+        stopLossPrice: signal.stop,
+        clientOrderId: compactId("open")
+      }, settings);
+      const actualFill = fillPriceFromOrder(order, signal.entry);
+      await this.storage.updateTrade(tradeId, {
+        entry: actualFill || signal.entry,
+        status: "open",
+        payload: {
+          signal,
+          order,
+          stop: signal.stop,
+          signalId: signal.id,
+          signalGrade: signal.grade,
+          requestedSize: size,
+          actualFill,
+          events: [
+            { at: new Date().toISOString(), type: "opened", signalId: signal.id, order }
+          ]
+        }
+      });
+      await this.storage.recordExecutionAudit?.({
+        tradeId,
+        signalEntry: signal.entry,
+        actualFill,
+        slippagePct: slippagePct(signal.entry, actualFill, signal.direction),
+        expectedStop: signal.stop,
+        actualStopOrderId: stopOrderIdFromOrder(order),
+        stopFillPrice: null,
+        stopSlippagePct: null,
+        fee: feeFromOrder(order),
+        feeAsset: feeAssetFromOrder(order),
+        payload: { signalId: signal.id, order }
+      });
+      await this.safeNotify(() => this.notifier.notifyOpen(settings, {
+        signal,
+        size,
+        entry: actualFill || signal.entry,
+        stop: signal.stop
+      }));
+      openPositions.push({
+        id: tradeId,
+        direction: signal.direction,
+        type: signal.type,
+        entry: actualFill || signal.entry,
+        size,
+        status: "open"
+      });
+      return {
+        action: "opened",
+        signalId: signal.id,
+        tradeId,
+        executed: true
+      };
+    } catch (error) {
+      await this.storage.updateTrade(tradeId, {
+        status: "execution_failed",
+        payload: {
+          signal,
+          risk,
+          requestedSize: size,
+          error: error.reason || error.message,
+          errorPayload: error.payload || null,
+          events: [{ at: new Date().toISOString(), type: "execution_failed", error: error.reason || error.message }]
+        }
+      });
+      logger.error({ module: "tradeDaemon", signalId: signal.id, tradeId, error: error.message }, "signal execution failed");
+      return {
+        action: "execution_failed",
+        signalId: signal.id,
+        tradeId,
+        reason: error.reason || error.message,
+        executed: false
+      };
+    }
   }
 
   async planPositionManagement({ position, market, settings, autoExecute }) {
-    if (shouldPartialTakeProfit(position, market.quote)) {
+    if (shouldPartialTakeProfit(position, market.quote, settings)) {
       if (!autoExecute) {
-        return { action: "would_partial_tp", tradeId: position.id, reason: "fakeout_1.5R", executed: false };
+        return { action: "would_partial_tp", tradeId: position.id, reason: `${positionType(position)}_${partialTakeProfitR(position, settings)}R`, executed: false };
       }
       const result = await this.executor.closeHalfPosition(position.id, {
         storage: this.storage,
@@ -684,13 +824,14 @@ export class TradeDaemon {
       });
       await this.safeNotify(() => this.notifier.notifyPartialTakeProfit(settings, {
         position,
-        pnl: 0
+        pnl: 0,
+        label: `${partialTakeProfitR(position, settings)}R`
       }));
       return { action: "partial_tp", tradeId: position.id, result, executed: true };
     }
-    if (shouldTrailingClose(position, market.h4)) {
+    if (shouldTrailingClose(position, market.h4, settings)) {
       if (!autoExecute) {
-        return { action: "would_trailing_close", tradeId: position.id, reason: "MA10_H4_cross", executed: false };
+        return { action: "would_trailing_close", tradeId: position.id, reason: `MA${trailingPeriod(position, settings)}_H4_cross`, executed: false };
       }
       const result = await this.executor.closePosition(position.id, {
         storage: this.storage,
