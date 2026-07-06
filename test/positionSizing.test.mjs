@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { orderSizeFor, partialTargetForSignal } from "../server/daemon/tradeDaemon.js";
+import { orderSizeFor, paperExecutionPrice, partialTargetForSignal } from "../server/daemon/tradeDaemon.js";
 
 test("daemon order sizing follows percent-risk grade multipliers", () => {
   const settings = {
@@ -71,4 +71,12 @@ test("fakeout partial target obeys feature switch and minimum lot", () => {
     entry: 2400,
     stop: 2380
   }, 2400, "0.01", settings), null);
+});
+
+test("paper execution prices use bid/ask plus configurable slippage", () => {
+  const settings = { paper: { slippageUsd: 0.1, spreadUsd: 0.3 } };
+  const quote = { bid: 2400, ask: 2400.3, mid: 2400.15, spread: 0.3 };
+  assert.equal(paperExecutionPrice({ side: "buy", quote, fallback: 2400.15, settings }).price, 2400.4);
+  assert.equal(paperExecutionPrice({ side: "sell", quote, fallback: 2400.15, settings }).price, 2399.9);
+  assert.equal(paperExecutionPrice({ side: "buy", quote: { mid: 2400 }, fallback: 2400, settings }).price, 2400.25);
 });

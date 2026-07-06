@@ -45,6 +45,76 @@ function quotePrice(market = {}, fallback = null) {
   return Number.isFinite(value) ? value : null;
 }
 
+function pnlMultiplier(settings = {}) {
+  const value = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+  return Number.isFinite(value) && value > 0 ? value : 100;
+}
+
+function paperSpreadUsd(settings = {}, quote = {}) {
+  const liveSpread = Number(quote?.spread);
+  if (Number.isFinite(liveSpread) && liveSpread >= 0) return liveSpread;
+  const configured = Number(settings?.paper?.spreadUsd ?? settings?.daemon?.paperSpreadUsd ?? process.env.PAPER_SPREAD_USD ?? 0.3);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 0.3;
+}
+
+function paperSlippageUsd(settings = {}) {
+  const configured = Number(settings?.paper?.slippageUsd ?? settings?.daemon?.paperSlippageUsd ?? process.env.PAPER_SLIPPAGE_USD ?? 0.1);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 0.1;
+}
+
+function paperFeeRate(settings = {}) {
+  const configured = Number(settings?.paper?.feeRate ?? settings?.daemon?.paperFeeRate ?? process.env.PAPER_FEE_RATE ?? 0.0005);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 0.0005;
+}
+
+function paperFee(price, size, settings = {}) {
+  const notional = Math.abs(Number(price || 0) * Number(size || 0) * pnlMultiplier(settings));
+  return round(notional * paperFeeRate(settings), 4);
+}
+
+function quoteMid(quote = {}, fallback = null) {
+  const value = Number(quote?.mid ?? quote?.last ?? fallback);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function paperExecutionPrice({ side, quote = {}, fallback = null, settings = {}, includeSlippage = true } = {}) {
+  const mid = quoteMid(quote, fallback);
+  const spread = paperSpreadUsd(settings, quote);
+  const slippage = includeSlippage ? paperSlippageUsd(settings) : 0;
+  const bid = Number(quote?.bid);
+  const ask = Number(quote?.ask);
+  let reference = null;
+  if (side === "buy") {
+    reference = Number.isFinite(ask) ? ask : Number.isFinite(mid) ? mid + spread / 2 : null;
+  } else if (side === "sell") {
+    reference = Number.isFinite(bid) ? bid : Number.isFinite(mid) ? mid - spread / 2 : null;
+  } else {
+    reference = mid;
+  }
+  const adjusted = Number.isFinite(reference)
+    ? reference + (side === "buy" ? slippage : side === "sell" ? -slippage : 0)
+    : null;
+  return {
+    price: Number.isFinite(adjusted) ? round(adjusted, 2) : null,
+    referencePrice: Number.isFinite(reference) ? round(reference, 2) : null,
+    mid: Number.isFinite(mid) ? round(mid, 2) : null,
+    spread: round(spread, 4),
+    slippageUsd: round(slippage, 4),
+    side,
+    source: quote?.bid || quote?.ask ? "bid_ask" : "synthetic_spread"
+  };
+}
+
+function closeablePaperPrice(direction, quote = {}, fallback = null, settings = {}) {
+  return paperExecutionPrice({
+    side: closeSideForDirection(direction),
+    quote,
+    fallback,
+    settings,
+    includeSlippage: false
+  }).price;
+}
+
 function startOfUtcDay(value = new Date()) {
   const date = new Date(value);
   date.setUTCHours(0, 0, 0, 0);
@@ -195,13 +265,13 @@ export function orderSizeFor(settings = {}, signal = {}, risk = {}) {
   const stopDistance = Math.abs(entry - stop);
   const equity = Number(risk.equity || settings?.paper?.initialBalanceUsdt || 10000);
   const riskPct = Number(settings?.risk?.perTradeRiskPct || 2) / 100;
-  const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+  const contractMultiplier = pnlMultiplier(settings);
   const minOrderSize = Number(settings?.daemon?.minOrderSize || process.env.OKX_MIN_ORDER_SIZE || 0.01);
   if (!Number.isFinite(entry) || !Number.isFinite(stop) || stopDistance <= 0 || equity <= 0) {
     return Math.max(minOrderSize, floorLot(Number(process.env.OKX_DEFAULT_ORDER_SIZE || 0.01), minOrderSize)).toFixed(2);
   }
   const riskAmount = equity * riskPct * gradeRiskMultiplier(signal.grade);
-  const raw = riskAmount / Math.max(0.01, stopDistance * pnlMultiplier);
+  const raw = riskAmount / Math.max(0.01, stopDistance * contractMultiplier);
   return Math.max(minOrderSize, floorLot(raw, minOrderSize)).toFixed(2);
 }
 
@@ -315,10 +385,22 @@ export function partialTargetForSignal(signal = {}, actualEntry = null, size = 0
   };
 }
 
-function paperOrder({ side, size, price, stop = null, clientOrderId, orderType = "market", state = "filled", reason = "paper" } = {}) {
+function paperOrder({
+  side,
+  size,
+  price,
+  stop = null,
+  clientOrderId,
+  orderType = "market",
+  state = "filled",
+  reason = "paper",
+  fee = 0,
+  execution = null
+} = {}) {
   const clOrdId = clientOrderId || compactId("paper");
   const ordId = compactId("paperord");
   const fillPx = Number(price);
+  const fillFee = Number(fee || 0);
   return {
     mode: "paper",
     paper: true,
@@ -343,20 +425,30 @@ function paperOrder({ side, size, price, stop = null, clientOrderId, orderType =
       clOrdId,
       fillPx: Number.isFinite(fillPx) ? fillPx : null,
       accFillSz: Number(size || 0),
-      fee: 0,
+      fee: Number.isFinite(fillFee) ? round(fillFee, 4) : 0,
       feeCcy: "USDT",
-      raw: { paper: true, reason }
+      raw: { paper: true, reason, execution }
     }
   };
 }
 
-function paperClosePnl(trade = {}, fill, size, settings = {}) {
+function allocatedEntryFee(trade = {}, closingSize = 0) {
+  const payload = trade.payload || {};
+  const currentSize = Number(trade.size || 0);
+  const feeRemaining = Number(payload.entryFeeRemaining ?? payload.entryFee ?? 0);
+  if (!Number.isFinite(feeRemaining) || feeRemaining <= 0 || !Number.isFinite(currentSize) || currentSize <= 0) return 0;
+  const ratio = Math.min(1, Math.max(0, Number(closingSize || 0) / currentSize));
+  return round(feeRemaining * ratio, 4);
+}
+
+function paperClosePnl(trade = {}, fill, size, settings = {}, { closeFee = 0, entryFee = 0 } = {}) {
   const price = Number(fill);
   const entry = Number(trade.entry);
   const amount = Number(size || trade.size || 0);
-  const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+  const contractMultiplier = pnlMultiplier(settings);
   if (!Number.isFinite(price) || !Number.isFinite(entry)) return Number(trade.pnl || 0);
-  return (price - entry) * directionSign(trade.direction) * amount * pnlMultiplier;
+  const gross = (price - entry) * directionSign(trade.direction) * amount * contractMultiplier;
+  return gross - Number(entryFee || 0) - Number(closeFee || 0);
 }
 
 function shouldPartialTakeProfit(position, quote, settings = {}) {
@@ -364,16 +456,16 @@ function shouldPartialTakeProfit(position, quote, settings = {}) {
   if (!takeProfitR || hasPartialTakeProfit(position)) return false;
   const entry = Number(position.entry);
   const stop = Number(position.stop || position.payload?.stop);
-  const current = Number(quote?.mid || position.price || entry);
+  const current = closeablePaperPrice(position.direction, quote, position.price || entry, settings);
   if (!entry || !stop || !current) return false;
   const r = Math.abs(entry - stop);
   const move = (current - entry) * directionSign(position.direction);
   return r > 0 && move >= r * takeProfitR;
 }
 
-function shouldStopLoss(position, quote) {
+function shouldStopLoss(position, quote, settings = {}) {
   const stop = Number(position.stop || position.payload?.stop);
-  const current = Number(quote?.mid || quote?.last || position.price);
+  const current = closeablePaperPrice(position.direction, quote, position.price, settings);
   if (!Number.isFinite(stop) || !Number.isFinite(current)) return false;
   return position.direction === "LONG" ? current <= stop : current >= stop;
 }
@@ -731,19 +823,36 @@ export class TradeDaemon {
     };
   }
 
-  async paperClosePosition(positionId, { settings = {}, reason = "closed", exitPrice = null } = {}) {
+  async paperClosePosition(positionId, { settings = {}, reason = "closed", exitPrice = null, market = {} } = {}) {
     const trade = await this.storage.getTradeById(positionId);
     if (!trade) throw new Error(`Trade ${positionId} was not found`);
-    const fill = Number(exitPrice || trade.exit || trade.entry);
+    const side = closeSideForDirection(trade.direction);
+    const fallback = exitPrice ?? trade.exit ?? trade.entry;
     const size = Number(trade.size || 0);
+    const execution = paperExecutionPrice({
+      side,
+      quote: market.quote || {},
+      fallback,
+      settings
+    });
+    const fill = Number(execution.price ?? fallback);
+    const closeFee = paperFee(fill, size, settings);
+    const entryFee = allocatedEntryFee(trade, size);
     const order = paperOrder({
-      side: closeSideForDirection(trade.direction),
+      side,
       size,
       price: fill,
       clientOrderId: compactId("pcls"),
-      reason
+      reason,
+      fee: closeFee,
+      execution
     });
-    const pnl = paperClosePnl(trade, fill, size, settings);
+    const closePnl = paperClosePnl(trade, fill, size, settings, { closeFee, entryFee });
+    const payload = trade.payload || {};
+    const realizedBefore = Number(payload.realizedPnl || 0);
+    const pnl = realizedBefore + closePnl;
+    const feeRemaining = Math.max(0, Number(payload.entryFeeRemaining ?? payload.entryFee ?? 0) - entryFee);
+    const feesPaid = Number(payload.feesPaid ?? payload.entryFee ?? 0) + closeFee;
     const status = reason === "timeout" ? "timeout" : reason === "stop_loss" ? "stopped_out" : "closed";
     await this.storage.updateTrade(positionId, {
       closedAt: new Date().toISOString(),
@@ -751,12 +860,16 @@ export class TradeDaemon {
       pnl: round(pnl),
       status,
       payload: {
-        ...(trade.payload || {}),
+        ...payload,
         exitReason: reason,
         closeOrder: order,
+        realizedPnl: round(pnl),
+        lastClosePnl: round(closePnl),
+        entryFeeRemaining: round(feeRemaining, 4),
+        feesPaid: round(feesPaid, 4),
         events: [
-          ...((trade.payload || {}).events || []),
-          { at: new Date().toISOString(), type: "paper_closed", reason, order }
+          ...(payload.events || []),
+          { at: new Date().toISOString(), type: "paper_closed", reason, sizeClosed: size, pnl: round(closePnl), order }
         ]
       }
     });
@@ -768,10 +881,12 @@ export class TradeDaemon {
       expectedStop: trade.payload?.stop || null,
       actualStopOrderId: order.response.ordId,
       stopFillPrice: Number.isFinite(fill) ? fill : null,
-      stopSlippagePct: null,
-      fee: 0,
+      stopSlippagePct: reason === "stop_loss" && trade.payload?.stop
+        ? slippagePct(trade.payload.stop, fill, trade.direction)
+        : null,
+      fee: closeFee,
       feeAsset: "USDT",
-      payload: { reason, order, paper: true }
+      payload: { reason, order, paper: true, entryFeeAllocated: entryFee, closeFee }
     });
     return {
       tradeId: positionId,
@@ -783,32 +898,55 @@ export class TradeDaemon {
     };
   }
 
-  async paperCloseHalfPosition(positionId, { settings = {}, exitPrice = null } = {}) {
+  async paperCloseHalfPosition(positionId, { settings = {}, exitPrice = null, market = {}, limitFill = false } = {}) {
     const trade = await this.storage.getTradeById(positionId);
     if (!trade) throw new Error(`Trade ${positionId} was not found`);
     const totalSize = Number(trade.size || 0);
     if (totalSize < 0.02) throw new Error("Position is too small for partial close");
     const size = floorLot(totalSize / 2, Number(settings?.daemon?.minOrderSize || 0.01));
     const remainingSize = floorLot(totalSize - size, Number(settings?.daemon?.minOrderSize || 0.01));
-    const fill = Number(exitPrice || trade.payload?.partialTargetPrice || trade.entry);
+    const side = closeSideForDirection(trade.direction);
+    const fallback = exitPrice ?? trade.payload?.partialTargetPrice ?? trade.entry;
+    const execution = paperExecutionPrice({
+      side,
+      quote: market.quote || {},
+      fallback,
+      settings,
+      includeSlippage: !limitFill
+    });
+    const fill = Number(execution.price ?? fallback);
+    const closeFee = paperFee(fill, size, settings);
+    const entryFee = allocatedEntryFee(trade, size);
+    const partialPnl = paperClosePnl(trade, fill, size, settings, { closeFee, entryFee });
+    const payload = trade.payload || {};
+    const realizedBefore = Number(payload.realizedPnl || 0);
+    const realizedPnl = realizedBefore + partialPnl;
+    const feeRemaining = Math.max(0, Number(payload.entryFeeRemaining ?? payload.entryFee ?? 0) - entryFee);
+    const feesPaid = Number(payload.feesPaid ?? payload.entryFee ?? 0) + closeFee;
     const order = paperOrder({
-      side: closeSideForDirection(trade.direction),
+      side,
       size,
       price: fill,
       clientOrderId: compactId("pptp"),
-      reason: "partial_take_profit"
+      reason: "partial_take_profit",
+      fee: closeFee,
+      execution
     });
     await this.storage.updateTrade(positionId, {
       size: remainingSize,
+      pnl: round(realizedPnl),
       status: "partial_closed",
       payload: {
-        ...(trade.payload || {}),
+        ...payload,
         partialTpAt: new Date().toISOString(),
         partialTpOrder: order,
-        originalSize: trade.payload?.originalSize || trade.size,
+        originalSize: payload.originalSize || trade.size,
+        realizedPnl: round(realizedPnl),
+        entryFeeRemaining: round(feeRemaining, 4),
+        feesPaid: round(feesPaid, 4),
         events: [
-          ...((trade.payload || {}).events || []),
-          { at: new Date().toISOString(), type: "paper_partial_tp", sizeClosed: size, remainingSize, order }
+          ...(payload.events || []),
+          { at: new Date().toISOString(), type: "paper_partial_tp", sizeClosed: size, remainingSize, pnl: round(partialPnl), order }
         ]
       }
     });
@@ -817,18 +955,19 @@ export class TradeDaemon {
       signalEntry: trade.entry,
       actualFill: order.fill.fillPx,
       slippagePct: null,
-      expectedStop: trade.payload?.stop || null,
+      expectedStop: payload.stop || null,
       actualStopOrderId: order.response.ordId,
       stopFillPrice: null,
       stopSlippagePct: null,
-      fee: 0,
+      fee: closeFee,
       feeAsset: "USDT",
-      payload: { reason: "partial_take_profit", sizeClosed: size, remainingSize, order, paper: true }
+      payload: { reason: "partial_take_profit", sizeClosed: size, remainingSize, pnl: round(partialPnl), order, paper: true, entryFeeAllocated: entryFee, closeFee }
     });
     return {
       tradeId: positionId,
       sizeClosed: size,
       remainingSize,
+      pnl: round(partialPnl),
       order
     };
   }
@@ -988,7 +1127,8 @@ export class TradeDaemon {
           await this.paperClosePosition(opposite.id, {
             settings,
             reason: "reverse_signal",
-            exitPrice: quotePrice(market, signal.entry)
+            exitPrice: signal.entry,
+            market
           });
         } else {
           await this.executor.closePosition(opposite.id, {
@@ -999,18 +1139,30 @@ export class TradeDaemon {
           });
         }
       }
-      const paperFill = quotePrice(market, signal.entry);
+      const openSide = sideForDirection(signal.direction);
+      const paperExecutionDetails = paperExecution
+        ? paperExecutionPrice({
+          side: openSide,
+          quote: market.quote || {},
+          fallback: signal.entry,
+          settings
+        })
+        : null;
+      const paperFill = paperExecutionDetails?.price ?? quotePrice(market, signal.entry);
+      const openFee = paperExecution ? paperFee(paperFill, size, settings) : 0;
       const order = paperExecution
         ? paperOrder({
-          side: sideForDirection(signal.direction),
+          side: openSide,
           size,
           price: paperFill,
           stop: signal.stop,
           clientOrderId: compactId("open"),
-          reason: "open"
+          reason: "open",
+          fee: openFee,
+          execution: paperExecutionDetails
         })
         : await this.executor.placePerpetualMarketOrder({
-          side: sideForDirection(signal.direction),
+          side: openSide,
           size,
           stopLossPrice: signal.stop,
           clientOrderId: compactId("open")
@@ -1055,6 +1207,9 @@ export class TradeDaemon {
           signalGrade: signal.grade,
           requestedSize: size,
           actualFill,
+          entryFee: feeFromOrder(order),
+          entryFeeRemaining: feeFromOrder(order),
+          feesPaid: feeFromOrder(order),
           partialTarget,
           partialTargetOrderId: partialTarget?.orderId || "",
           partialTargetClOrdId: partialTarget?.clOrdId || "",
@@ -1131,9 +1286,11 @@ export class TradeDaemon {
     let fill = null;
     if (isPaperExecution(settings)) {
       const targetPrice = Number(payload.partialTargetPrice || payload.partialTarget?.price);
-      const current = Number(quote?.mid || quote?.last || position.price || position.entry);
+      const current = closeablePaperPrice(position.direction, quote, position.price || position.entry, settings);
       const hit = Number.isFinite(targetPrice) && Number.isFinite(current)
         && (position.direction === "LONG" ? current >= targetPrice : current <= targetPrice);
+      const targetSize = Number(payload.partialTargetSize || Number(position.size || 0) / 2);
+      const fee = hit ? paperFee(targetPrice, targetSize, settings) : 0;
       fill = hit
         ? {
           confirmed: true,
@@ -1141,8 +1298,8 @@ export class TradeDaemon {
           ordId,
           clOrdId,
           fillPx: targetPrice,
-          accFillSz: Number(payload.partialTargetSize || Number(position.size || 0) / 2),
-          fee: 0,
+          accFillSz: targetSize,
+          fee,
           feeCcy: "USDT",
           raw: { paper: true, current }
         }
@@ -1182,12 +1339,17 @@ export class TradeDaemon {
       const closedSize = floorLot(Number(fill.accFillSz || payload.partialTargetSize || Number(position.size || 0) / 2), minOrderSize);
       const remainingSize = floorLot(Math.max(0, Number(position.size || 0) - closedSize), minOrderSize);
       const fillPx = Number(fill.fillPx || payload.partialTargetPrice || position.entry);
-      const pnlMultiplier = Number(settings?.daemon?.pnlMultiplier || process.env.OKX_PNL_MULTIPLIER || 100);
+      const closeFee = Number(fill.fee || 0);
+      const entryFee = allocatedEntryFee(position, closedSize);
       const partialPnl = Number.isFinite(fillPx)
-        ? (fillPx - Number(position.entry)) * directionSign(position.direction) * closedSize * pnlMultiplier
+        ? paperClosePnl(position, fillPx, closedSize, settings, { closeFee, entryFee })
         : 0;
+      const realizedPnl = Number(payload.realizedPnl || 0) + partialPnl;
+      const feeRemaining = Math.max(0, Number(payload.entryFeeRemaining ?? payload.entryFee ?? 0) - entryFee);
+      const feesPaid = Number(payload.feesPaid ?? payload.entryFee ?? 0) + closeFee;
       await this.storage.updateTrade(position.id, {
         size: remainingSize,
+        pnl: round(realizedPnl),
         status: "partial_closed",
         payload: {
           ...payload,
@@ -1196,6 +1358,9 @@ export class TradeDaemon {
           partialTargetFill: fill,
           partialTpOrder: payload.partialTarget?.order || null,
           originalSize: payload.originalSize || position.size,
+          realizedPnl: round(realizedPnl),
+          entryFeeRemaining: round(feeRemaining, 4),
+          feesPaid: round(feesPaid, 4),
           events: [
             ...(payload.events || []),
             {
@@ -1204,6 +1369,8 @@ export class TradeDaemon {
               sizeClosed: closedSize,
               remainingSize,
               pnl: round(partialPnl),
+              entryFeeAllocated: entryFee,
+              closeFee,
               fill
             }
           ]
@@ -1218,12 +1385,15 @@ export class TradeDaemon {
         actualStopOrderId: ordId || clOrdId,
         stopFillPrice: null,
         stopSlippagePct: null,
-        fee: fill.fee || 0,
+        fee: closeFee,
         feeAsset: fill.feeCcy || "USDT",
         payload: {
           reason: "partial_target",
           sizeClosed: closedSize,
           remainingSize,
+          pnl: round(partialPnl),
+          entryFeeAllocated: entryFee,
+          closeFee,
           fill
         }
       });
@@ -1249,14 +1419,15 @@ export class TradeDaemon {
   }
 
   async planPositionManagement({ position, market, settings, autoExecute }) {
-    if (isPaperExecution(settings) && shouldStopLoss(position, market.quote)) {
+    if (isPaperExecution(settings) && shouldStopLoss(position, market.quote, settings)) {
       if (!autoExecute) {
         return { action: "would_stop_loss_close", tradeId: position.id, reason: "paper_stop_loss", executed: false };
       }
       const result = await this.paperClosePosition(position.id, {
         settings,
         reason: "stop_loss",
-        exitPrice: position.stop || position.payload?.stop || quotePrice(market, position.price)
+        exitPrice: position.stop || position.payload?.stop || quotePrice(market, position.price),
+        market
       });
       await this.safeNotify(() => this.notifier.notifyClose(settings, {
         position,
@@ -1283,7 +1454,8 @@ export class TradeDaemon {
       const result = isPaperExecution(settings)
         ? await this.paperCloseHalfPosition(position.id, {
           settings,
-          exitPrice: quotePrice(market, position.payload?.partialTargetPrice || position.entry)
+          exitPrice: position.payload?.partialTargetPrice || position.entry,
+          market
         })
         : await this.executor.closeHalfPosition(position.id, {
           storage: this.storage,
@@ -1304,7 +1476,8 @@ export class TradeDaemon {
         ? await this.paperClosePosition(position.id, {
           settings,
           reason: "trailing_stop",
-          exitPrice: market.h4.at(-1)?.close || quotePrice(market, position.entry)
+          exitPrice: market.h4.at(-1)?.close || quotePrice(market, position.entry),
+          market
         })
         : await this.executor.closePosition(position.id, {
           storage: this.storage,
@@ -1327,7 +1500,8 @@ export class TradeDaemon {
         ? await this.paperClosePosition(position.id, {
           settings,
           reason: "timeout",
-          exitPrice: quotePrice(market, position.price)
+          exitPrice: quotePrice(market, position.price),
+          market
         })
         : await this.executor.closePosition(position.id, {
           storage: this.storage,

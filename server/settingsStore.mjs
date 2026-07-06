@@ -15,7 +15,11 @@ export const defaultSettings = {
     tradeMode: "paper"
   },
   paper: {
-    initialBalanceUsdt: 10000
+    initialBalanceUsdt: 10000,
+    marginLeverage: 5,
+    spreadUsd: 0.3,
+    slippageUsd: 0.1,
+    feeRate: 0.0005
   },
   daemon: {
     enabled: true,

@@ -296,9 +296,17 @@ function exitReasonLabel(reason) {
 }
 
 function okxVerifyLabel(position) {
+  if (position.okxStatus === "paper") return "本地纸盘";
   if (position.okxVerified === true) return "OKX已校验";
   if (position.okxVerified === false) return "OKX未匹配";
   return "OKX待校验";
+}
+
+function tradeConnectionLabel(status) {
+  if (status === "paper_skipped") return "本地纸盘撮合";
+  if (status === "ok") return "OKX持仓已校验";
+  if (status === "unavailable") return "OKX持仓不可用";
+  return "持仓校验待确认";
 }
 
 function isExecutableSignal(signal) {
@@ -913,7 +921,7 @@ function renderTrades() {
   return `
     <div class="grid">
       ${metric("模拟余额", fmt(account.balance, " USDT"), `初始 ${fmt(account.initialBalance, " USDT")}`)}
-      ${metric("可用保证金", fmt(account.availableMargin, " USDT"), `占用 ${fmt(account.usedMargin, " USDT")}`)}
+      ${metric("可用保证金", fmt(account.availableMargin, " USDT"), `占用 ${fmt(account.usedMargin, " USDT")} · ${fmt(account.marginLeverage || 5, "x")}`)}
       ${metric("总 PnL", fmt(data.metrics.totalPnl, " USD"), "已平仓", data.metrics.totalPnl >= 0 ? "positive" : "negative")}
       ${metric("胜率", fmt(data.metrics.winRate, "%"), "动态更新")}
       ${metric("盈亏比", fmt(data.metrics.profitFactor), "Profit Factor")}
@@ -922,7 +930,7 @@ function renderTrades() {
       <section class="panel span-12">
         <div class="panel-head">
           <h2>交易分组统计</h2>
-          <span class="status-pill ${data.okxStatus === "ok" ? "ok" : ""}">${data.okxStatus === "ok" ? "OKX持仓已校验" : "OKX持仓待校验"}</span>
+          <span class="status-pill ${["ok", "paper_skipped"].includes(data.okxStatus) ? "ok" : ""}">${tradeConnectionLabel(data.okxStatus)}</span>
         </div>
         <div class="trade-stat-row">
           ${tradeStatCard(fakeoutStat)}
@@ -1285,6 +1293,10 @@ function renderSettings() {
           ${toggle("api.oandaTokenConfigured", "OANDA Key 已放入服务器", settings.api.oandaTokenConfigured)}
           ${toggle("api.okxTradingConfigured", "OKX 交易 Key 已放入服务器", settings.api.okxTradingConfigured)}
           <label>模拟账户初始余额 USDT<input name="paper.initialBalanceUsdt" type="number" step="1" min="0" value="${settings.paper?.initialBalanceUsdt ?? 10000}"></label>
+          <label>纸盘保证金杠杆<input name="paper.marginLeverage" type="number" step="0.1" min="1" value="${settings.paper?.marginLeverage ?? 5}"></label>
+          <label>纸盘点差 USD<input name="paper.spreadUsd" type="number" step="0.01" min="0" value="${settings.paper?.spreadUsd ?? 0.3}"></label>
+          <label>纸盘滑点 USD<input name="paper.slippageUsd" type="number" step="0.01" min="0" value="${settings.paper?.slippageUsd ?? 0.1}"></label>
+          <label>纸盘手续费率<input name="paper.feeRate" type="number" step="0.0001" min="0" value="${settings.paper?.feeRate ?? 0.0005}"></label>
         </div>
       </section>
 

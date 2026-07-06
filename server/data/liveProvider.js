@@ -43,15 +43,55 @@ function mockGoldCurve() {
   return goldCurveFromCandles(mock.makeKlines("D"));
 }
 
-function withQuotePosition(position, quote) {
-  if (!position || !quote?.mid) return position;
+function pnlMultiplier(settings = {}) {
+  const value = Number(settings?.daemon?.pnlMultiplier || 100);
+  return Number.isFinite(value) && value > 0 ? value : 100;
+}
+
+function paperMarginLeverage(settings = {}) {
+  const value = Number(settings?.paper?.marginLeverage || 5);
+  return Number.isFinite(value) && value > 0 ? value : 5;
+}
+
+function closeablePrice(direction, quote = {}, fallback = null, settings = {}) {
+  const bid = Number(quote?.bid);
+  const ask = Number(quote?.ask);
+  const mid = Number(quote?.mid ?? quote?.last ?? fallback);
+  const spread = Number.isFinite(Number(quote?.spread))
+    ? Number(quote.spread)
+    : Number(settings?.paper?.spreadUsd ?? 0.3);
+  if (direction === "LONG" && Number.isFinite(bid)) return bid;
+  if (direction === "SHORT" && Number.isFinite(ask)) return ask;
+  if (!Number.isFinite(mid)) return null;
+  if (direction === "LONG") return mid - Math.max(0, spread) / 2;
+  if (direction === "SHORT") return mid + Math.max(0, spread) / 2;
+  return mid;
+}
+
+function positionNotional(position = {}, settings = {}) {
+  return Math.abs(Number(position.entry || 0) * Number(position.size || 0) * pnlMultiplier(settings));
+}
+
+function positionMargin(position = {}, settings = {}) {
+  return positionNotional(position, settings) / paperMarginLeverage(settings);
+}
+
+function withQuotePosition(position, quote, settings = {}) {
+  if (!position || !quote) return position;
+  const price = closeablePrice(position.direction, quote, position.price || position.entry, settings);
+  if (!Number.isFinite(price)) return position;
   const sign = position.direction === "SHORT" ? -1 : 1;
-  const pnl = (quote.mid - position.entry) * sign * position.size * 100;
+  const payload = position.payload || {};
+  const grossPnl = (price - position.entry) * sign * position.size * pnlMultiplier(settings);
+  const realizedPnl = Number(payload.realizedPnl || 0);
+  const entryFeeRemaining = Number(payload.entryFeeRemaining || 0);
+  const pnl = realizedPnl + grossPnl - entryFeeRemaining;
+  const notional = positionNotional(position, settings);
   return {
     ...position,
-    price: quote.mid,
+    price: round(price),
     pnl: round(pnl),
-    pnlPct: round(((quote.mid - position.entry) / position.entry) * 100 * sign)
+    pnlPct: round(notional ? (pnl / notional) * 100 : ((price - position.entry) / position.entry) * 100 * sign)
   };
 }
 
@@ -68,12 +108,20 @@ function normalizedType(value) {
 
 function enrichPosition(position) {
   const type = normalizedType(position.type || position.payload?.signalType);
+  const partialLocked = Boolean(position.payload?.partialTpAt || position.payload?.partialClosedAt || position.status === "partial_closed");
+  const partialPending = type === "fakeout" && !partialLocked && Boolean(position.payload?.partialTargetPrice || position.payload?.partialTarget);
   return {
     ...position,
     type,
     signalType: type,
     durationLabel: durationLabel(position.durationMinutes),
-    halfProfitLabel: type === "fakeout" ? "半仓已锁利 @1.5R / 剩余 MA10 跟踪中" : ""
+    halfProfitLabel: type === "fakeout"
+      ? partialLocked
+        ? "半仓已锁利 @1.5R / 剩余 MA10 跟踪中"
+        : partialPending
+          ? "半仓止盈挂单 @1.5R / 等待触发"
+          : ""
+      : ""
   };
 }
 
@@ -91,17 +139,18 @@ function samePosition(left, right) {
   return sameUnderlying(left.symbol, right.symbol) && left.direction === right.direction;
 }
 
-function mergeOkxPositions({ positions = [], okxPositions = [], quote = null, okxAvailable = false }) {
+function mergeOkxPositions({ positions = [], okxPositions = [], quote = null, okxAvailable = false, settings = {} }) {
   const usedOkx = new Set();
+  const paperMode = isPaperTradeMode(settings);
   const merged = positions.map((position) => {
-    const quoted = quote ? withQuotePosition(position, quote) : position;
+    const quoted = quote ? withQuotePosition(position, quote, settings) : position;
     const match = okxPositions.find((item) => !usedOkx.has(item.id) && samePosition(quoted, item));
     if (!match) {
       return enrichPosition({
         ...quoted,
         source: "database",
-        okxVerified: okxAvailable ? false : null,
-        okxStatus: okxAvailable ? "missing_on_okx" : "unavailable"
+        okxVerified: paperMode ? null : okxAvailable ? false : null,
+        okxStatus: paperMode ? "paper" : okxAvailable ? "missing_on_okx" : "unavailable"
       });
     }
     usedOkx.add(match.id);
@@ -148,7 +197,10 @@ function emptyTradeCenter(settings, goldCurve = mockGoldCurve()) {
       balance: initialBalance,
       availableMargin: initialBalance,
       usedMargin: 0,
-      floatingPnl: 0
+      floatingPnl: 0,
+      marginLeverage: paperMarginLeverage(settings),
+      notional: 0,
+      marginLevelPct: 0
     },
     positions: [],
     history: [],
@@ -250,7 +302,9 @@ function tradeCenterFromRows({ positions = [], history = [], settings, goldCurve
   const grossLoss = Math.abs(losses.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0));
   const pnlCurve = dailyPnlCurve({ history, initialBalance, goldCurve });
   const floatingPnl = round(positions.reduce((sum, position) => sum + Number(position.pnl || 0), 0));
-  const usedMargin = round(positions.reduce((sum, position) => sum + Math.abs(Number(position.entry || 0) * Number(position.size || 0)), 0));
+  const notional = round(positions.reduce((sum, position) => sum + positionNotional(position, settings), 0));
+  const usedMargin = round(positions.reduce((sum, position) => sum + positionMargin(position, settings), 0));
+  const equity = round(initialBalance + totalPnl + floatingPnl);
   const expectedCurve = expectedCurveFromRun(latestRun, initialBalance, goldCurve.length || pnlCurve.length || 80);
   const expectedPnl = expectedCurve.length ? round(expectedCurve.at(-1).v - initialBalance) : 0;
   const actualPnl = round(totalPnl + floatingPnl);
@@ -266,10 +320,13 @@ function tradeCenterFromRows({ positions = [], history = [], settings, goldCurve
     account: {
       currency: "USDT",
       initialBalance,
-      balance: round(initialBalance + totalPnl + floatingPnl),
-      availableMargin: round(initialBalance + totalPnl + floatingPnl - usedMargin),
+      balance: equity,
+      availableMargin: round(equity - usedMargin),
       usedMargin,
-      floatingPnl
+      floatingPnl,
+      marginLeverage: paperMarginLeverage(settings),
+      notional,
+      marginLevelPct: usedMargin ? round((equity / usedMargin) * 100) : 0
     },
     positions,
     history,
@@ -495,7 +552,7 @@ export class LiveDataProvider {
     base.positions = positions.map(enrichPosition);
     if (quote) {
       base.quote = quote;
-      base.positions = base.positions.map((position) => withQuotePosition(position, quote));
+      base.positions = base.positions.map((position) => withQuotePosition(position, quote, settings));
     }
 
     return {
@@ -557,7 +614,8 @@ export class LiveDataProvider {
       positions,
       okxPositions,
       quote,
-      okxAvailable: isSettledOk(okxResult)
+      okxAvailable: useOkxPositions && isSettledOk(okxResult),
+      settings
     });
     const output = tradeCenterFromRows({ positions, history, settings, goldCurve, latestRun });
     if (filters.status === "open") output.history = [];
