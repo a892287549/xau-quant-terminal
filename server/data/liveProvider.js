@@ -230,6 +230,17 @@ function expectedCurveFromRun(run, initialBalance, fallbackLength = 80) {
   }));
 }
 
+function compactBacktestRun(run) {
+  if (!run) return run;
+  return {
+    ...run,
+    equity: (run.equity || []).slice(-300),
+    monteCarlo: (run.monteCarlo || []).slice(0, 120),
+    equityPoints: run.equity?.length || 0,
+    monteCarloPoints: run.monteCarlo?.length || 0
+  };
+}
+
 function tradeCenterFromRows({ positions = [], history = [], settings, goldCurve = mockGoldCurve(), latestRun = null }) {
   const initialBalance = Number(settings?.paper?.initialBalanceUsdt || 10000);
   const totalPnl = round(history.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0));
@@ -580,7 +591,7 @@ export class LiveDataProvider {
     const lastRuns = await this.storage.getBacktestRuns(10);
     return {
       parameters: lastRuns[0]?.params || {},
-      lastRuns
+      lastRuns: lastRuns.map(compactBacktestRun)
     };
   }
 

@@ -1165,7 +1165,7 @@ function renderBacktests() {
           <label>技术权重<input name="technicalWeight" type="number" step="0.01" min="0" max="1" value="${result.params.technicalWeight}"></label>
           <label>资金权重<input name="flowWeight" type="number" step="0.01" min="0" max="1" value="${result.params.flowWeight}"></label>
           <label>仓位系数<input name="positionFactor" type="number" step="0.01" min="0.01" max="0.5" value="${result.params.positionFactor}"></label>
-          <label>蒙特卡洛次数<input name="monteCarloRuns" type="number" min="20" max="1000" value="${result.monteCarlo.length}"></label>
+	          <label>蒙特卡洛次数<input name="monteCarloRuns" type="number" min="20" max="1000" value="${result.monteCarloPoints || result.monteCarlo.length}"></label>
           ${toggle("allowBSignals", "允许 B 级信号入场（半仓）", allowBSignals)}
           ${toggle("allowCSignals", "允许 C 级信号入场（1/4仓）", allowCSignals)}
           <button class="primary" type="submit">一键回测</button>
