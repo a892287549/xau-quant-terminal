@@ -304,6 +304,7 @@ export class OkxExecutor {
       status,
       sizeClosed: size,
       remainingSize: 0,
+      pnl: Number(Number(pnl || 0).toFixed(2)),
       order
     };
   }

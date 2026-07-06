@@ -164,17 +164,22 @@ export class TradeDaemon {
     okxAdapter,
     okxExecutor,
     macroFetcher,
-    storage
+    storage,
+    notifier = null
   }) {
     this.getSettings = getSettings;
     this.okx = okxAdapter;
     this.executor = okxExecutor;
     this.macroFetcher = macroFetcher;
     this.storage = storage;
+    this.notifier = notifier;
     this.timer = null;
     this.running = false;
     this.lastScan = null;
     this.lastResult = null;
+    this.notifiedSignals = new Set();
+    this.notifiedRiskKeys = new Set();
+    this.lastDailySummaryKey = "";
   }
 
   status() {
@@ -254,6 +259,9 @@ export class TradeDaemon {
       const actions = [];
       let executed = 0;
 
+      await this.notifyRiskIfNeeded(settings, risk);
+      await this.maybeNotifyDailySummary(settings, history, openPositions);
+
       for (const position of openPositions) {
         const action = await this.planPositionManagement({ position, market, settings, autoExecute });
         if (action) {
@@ -263,6 +271,7 @@ export class TradeDaemon {
       }
 
       for (const signal of signals) {
+        await this.notifySignalOnce(settings, signal);
         const action = await this.planSignalExecution({
           signal,
           openPositions,
@@ -291,6 +300,61 @@ export class TradeDaemon {
     } finally {
       this.running = false;
     }
+  }
+
+  async safeNotify(task) {
+    if (!this.notifier) return;
+    try {
+      await task();
+    } catch (error) {
+      console.warn(`[${new Date().toISOString()}] feishu notify failed: ${error.message}`);
+    }
+  }
+
+  async notifySignalOnce(settings, signal) {
+    if (this.notifiedSignals.has(signal.id)) return;
+    this.notifiedSignals.add(signal.id);
+    await this.safeNotify(() => this.notifier.notifySignal(settings, signal));
+  }
+
+  async notifyRiskIfNeeded(settings, risk) {
+    if (risk.stoppedOutToday >= risk.maxDailyStops) {
+      const key = `daily-${new Date().toISOString().slice(0, 10)}`;
+      if (!this.notifiedRiskKeys.has(key)) {
+        this.notifiedRiskKeys.add(key);
+        await this.safeNotify(() => this.notifier.notifyDailyCircuit(settings, risk));
+      }
+    }
+    if (risk.weeklyDrawdownPct >= risk.weeklyPausePct) {
+      const key = `weekly-${startOfUtcWeek().toISOString().slice(0, 10)}`;
+      if (!this.notifiedRiskKeys.has(key)) {
+        this.notifiedRiskKeys.add(key);
+        await this.safeNotify(() => this.notifier.notifyWeeklyDrawdown(settings, risk));
+      }
+    }
+  }
+
+  async maybeNotifyDailySummary(settings, history = [], openPositions = []) {
+    const now = new Date();
+    if (now.getUTCHours() !== 21) return;
+    const key = now.toISOString().slice(0, 10);
+    if (this.lastDailySummaryKey === key) return;
+    this.lastDailySummaryKey = key;
+    const today = startOfUtcDay(now);
+    const week = startOfUtcWeek(now);
+    const todayTrades = history.filter((trade) => trade.closedAt && new Date(trade.closedAt) >= today);
+    const weekTrades = history.filter((trade) => trade.closedAt && new Date(trade.closedAt) >= week);
+    const pnl = todayTrades.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+    const weekPnl = weekTrades.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+    const wins = todayTrades.filter((trade) => Number(trade.pnl || 0) > 0).length;
+    const winRate = todayTrades.length ? Math.round((wins / todayTrades.length) * 100) : 0;
+    await this.safeNotify(() => this.notifier.notifyDailySummary(settings, {
+      trades: todayTrades.length,
+      pnl,
+      winRate,
+      positions: openPositions.length,
+      weekPnl
+    }));
   }
 
   async planSignalExecution({ signal, openPositions, risk, settings, autoExecute }) {
@@ -370,6 +434,12 @@ export class TradeDaemon {
       signalId: signal.id,
       payload: { signal, order }
     });
+    await this.safeNotify(() => this.notifier.notifyOpen(settings, {
+      signal,
+      size: orderSizeFor(settings),
+      entry: signal.entry,
+      stop: signal.stop
+    }));
     return {
       action: "opened",
       signalId: signal.id,
@@ -387,6 +457,10 @@ export class TradeDaemon {
         storage: this.storage,
         settings
       });
+      await this.safeNotify(() => this.notifier.notifyPartialTakeProfit(settings, {
+        position,
+        pnl: 0
+      }));
       return { action: "partial_tp", tradeId: position.id, result, executed: true };
     }
     if (shouldTrailingClose(position, market.h4)) {
@@ -399,6 +473,11 @@ export class TradeDaemon {
         reason: "trailing_stop",
         exitPrice: market.h4.at(-1)?.close
       });
+      await this.safeNotify(() => this.notifier.notifyClose(settings, {
+        position,
+        pnl: result.pnl || 0,
+        reason: "trailing_stop"
+      }));
       return { action: "trailing_close", tradeId: position.id, result, executed: true };
     }
     if (shouldTimeout(position)) {
@@ -411,6 +490,11 @@ export class TradeDaemon {
         reason: "timeout",
         exitPrice: market.quote?.mid || position.price
       });
+      await this.safeNotify(() => this.notifier.notifyClose(settings, {
+        position,
+        pnl: result.pnl || 0,
+        reason: "timeout"
+      }));
       return { action: "timeout_close", tradeId: position.id, result, executed: true };
     }
     return null;

@@ -12,6 +12,7 @@ import { OandaAdapter } from "./data/oandaAdapter.js";
 import { OkxAdapter } from "./data/okxAdapter.js";
 import { OkxExecutor } from "./execution/okxExecutor.js";
 import { TradeDaemon } from "./daemon/tradeDaemon.js";
+import { FeishuNotifier } from "./notifications/feishuNotifier.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
@@ -29,13 +30,15 @@ const oandaAdapter = new OandaAdapter();
 const okxAdapter = new OkxAdapter();
 const okxExecutor = new OkxExecutor();
 const macroFetcher = new MacroFetcher({ dataDir, storage });
+const feishuNotifier = new FeishuNotifier();
 const dataProvider = new LiveDataProvider({ oandaAdapter, okxAdapter, macroFetcher, storage });
 const tradeDaemon = new TradeDaemon({
   getSettings: async () => runtimeSettings(await settingsStore.read()),
   okxAdapter,
   okxExecutor,
   macroFetcher,
-  storage
+  storage,
+  notifier: feishuNotifier
 });
 
 const mimeTypes = {

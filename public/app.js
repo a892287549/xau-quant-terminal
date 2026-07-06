@@ -1198,6 +1198,14 @@ function renderSettings() {
       </section>
 
       <section class="panel span-6">
+        <h2>飞书告警</h2>
+        <div class="form-grid">
+          ${toggle("notifications.feishu.enabled", "启用飞书机器人", settings.notifications?.feishu?.enabled ?? false)}
+          <label>Webhook URL<input name="notifications.feishu.webhookUrl" value="${esc(settings.notifications?.feishu?.webhookUrl || "")}" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..."></label>
+        </div>
+      </section>
+
+      <section class="panel span-6">
         <h2>风险参数</h2>
         <div class="form-grid">
           <label>单笔基础风险 %<input name="risk.perTradeRiskPct" type="number" step="0.1" value="${settings.risk.perTradeRiskPct}"></label>

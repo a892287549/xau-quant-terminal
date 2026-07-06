@@ -21,6 +21,12 @@ export const defaultSettings = {
     scanIntervalMinutes: 5,
     autoExecute: false
   },
+  notifications: {
+    feishu: {
+      enabled: false,
+      webhookUrl: ""
+    }
+  },
   risk: {
     maxPositionPct: 12,
     perTradeRiskPct: 2,
