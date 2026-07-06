@@ -339,8 +339,10 @@ function macroMetric(compass) {
 
 function renderDashboard() {
   const d = state.data.dashboard;
+  const trades = state.data.trades || {};
   const position = d.positions[0];
   const risk = d.risk;
+  const deviation = trades.deviation || {};
   const decision = d.tradeDecision;
   const executableSignals = d.activeSignals.filter(isExecutableSignal);
   const activeTrend = d.macroCompass.factors[1]?.history?.slice(-24).map((point) => point.v) || [];
@@ -348,6 +350,8 @@ function renderDashboard() {
     ? d.macroCompass.factors[0]?.history?.slice(-24).map((point, index) => point.v + index * (position.pnl >= 0 ? 0.2 : -0.2)) || []
     : Array.from({ length: 24 }, () => 0);
   const riskTrend = Array.from({ length: 24 }, (_, index) => risk.remainingNotionalPct - Math.sin(index / 2.8) * 3);
+  const sessionLabel = risk.sessionStatus || (risk.sessionLocked ? "锁仓" : "交易中");
+  const deviationLabel = deviation.expectedPnl ? `${fmt(deviation.ratioPct, "%")}` : "待对比";
   return `
     <div class="grid">
       <section class="decision-card span-12 ${decision.action === "NO_TRADE" ? "danger" : decision.action?.startsWith("ALLOW_") ? "go" : "watch"}">
@@ -368,6 +372,32 @@ function renderDashboard() {
       ${metric("活跃信号", fmt(executableSignals.length), "S/A/B/C", "", activeTrend)}
       ${metric("持仓浮盈", position ? fmt(position.pnl, " USD") : "0 USD", position ? `${directionLabel(position.direction)} ${position.size} 手` : "无持仓", position ? (position.pnl >= 0 ? "positive flash-up" : "negative flash-down") : "neutral", pnlTrend)}
       ${metric("风控状态", risk.circuitBreaker ? "熔断" : "正常", `剩余额度 ${risk.remainingNotionalPct}%`, risk.circuitBreaker ? "negative flash-down" : "positive flash-up", riskTrend)}
+
+      <section class="panel span-5">
+        <div class="panel-head">
+          <h2>风控面板</h2>
+          <span class="status-pill ${risk.circuitBreaker ? "" : "ok"}">${esc(risk.status || "正常")}</span>
+        </div>
+        <div class="risk-card-row">
+          <div class="risk-card"><span>日内止损</span><strong>${risk.stoppedOutToday}/${risk.maxDailyStops}</strong></div>
+          <div class="risk-card"><span>周回撤</span><strong class="${risk.weeklyLossPct > 0 ? "warning" : "positive"}">${fmt(risk.weeklyLossPct, "%")}</strong></div>
+          <div class="risk-card"><span>熔断</span><strong class="${risk.circuitBreaker ? "negative" : "positive"}">${risk.circuitBreaker ? "触发" : "正常"}</strong></div>
+          <div class="risk-card"><span>时段</span><strong class="${risk.sessionLocked ? "warning" : "positive"}">${esc(sessionLabel)}</strong></div>
+        </div>
+        <div class="position-line"><span>回测偏离率</span><strong class="${Math.abs(Number(deviation.ratioPct || 0)) > 120 ? "warning" : "blue"}">${deviationLabel}</strong></div>
+        <div class="position-line"><span>实际 / 预期 PnL</span><strong>${fmt(deviation.actualPnl || 0, " USD")} / ${fmt(deviation.expectedPnl || 0, " USD")}</strong></div>
+      </section>
+
+      <section class="panel span-7">
+        <div class="panel-head">
+          <h2>账户净值走势</h2>
+          <div class="chart-legend" aria-label="净值曲线图例">
+            <span><i class="legend-dot legend-pnl"></i>实际净值</span>
+            <span><i class="legend-dot legend-xau"></i>回测预期</span>
+          </div>
+        </div>
+        <canvas id="dashboardEquityChart" class="chart"></canvas>
+      </section>
 
       <section class="panel span-7">
         <div class="panel-head">
@@ -426,10 +456,9 @@ function renderDashboard() {
       </section>
 
       <section class="panel span-3">
-        <h2>风控状态</h2>
-        <div class="position-line"><span>熔断</span><strong>${risk.circuitBreaker ? "触发" : "未触发"}</strong></div>
-        <div class="position-line"><span>今日止损</span><strong>${risk.stoppedOutToday}/${risk.maxDailyStops}</strong></div>
+        <h2>风控细节</h2>
         <div class="position-line"><span>日亏损</span><strong>${risk.dailyLossPct}% / ${risk.dailyLimitPct}%</strong></div>
+        <div class="position-line"><span>周限制</span><strong>${risk.weeklyLossPct}% / ${risk.weeklyLimitPct}%</strong></div>
         <div class="position-line"><span>事件熔断</span><strong>${risk.eventCircuitBreaker ? "开启" : "关闭"}</strong></div>
       </section>
     </div>
@@ -762,10 +791,56 @@ function renderMacro() {
   `;
 }
 
+function tradeTypeStat(data, type) {
+  return (data.typeStats || []).find((item) => item.type === type)
+    || { type, count: 0, pnl: 0, winRate: 0 };
+}
+
+function tradeStatCard(stat) {
+  return `
+    <div class="trade-stat-card">
+      <span>${esc(typeLabel(stat.type))}</span>
+      <strong class="${Number(stat.pnl || 0) >= 0 ? "positive" : "negative"}">${fmt(stat.pnl, " USD")}</strong>
+      <small>${stat.count}笔 · 胜率 ${fmt(stat.winRate, "%")}</small>
+    </div>
+  `;
+}
+
+function renderPositionCard(position) {
+  const pnlClass = Number(position.pnl || 0) >= 0 ? "positive" : "negative";
+  const verifyClass = position.okxVerified === true ? "ok" : "";
+  return `
+    <div class="position-card ${position.direction === "SHORT" ? "short" : "long"}">
+      <div class="position-card-head">
+        <div>
+          <strong>${esc(position.symbol || "XAU-USDT-SWAP")}</strong>
+          <span class="label">${esc(typeLabel(position.signalType || position.type || "manual"))}</span>
+        </div>
+        <div class="position-badges">
+          <span class="direction-tag ${directionTagClass(position.direction)}">${esc(directionLabel(position.direction))}</span>
+          <span class="status-pill ${verifyClass}">${esc(okxVerifyLabel(position))}</span>
+        </div>
+      </div>
+      <div class="position-value ${pnlClass}">
+        ${fmt(position.pnl, " USD")} <span>${fmt(position.pnlPct, "%")}</span>
+      </div>
+      <div class="position-grid">
+        <div><span>入场价</span><strong>${fmt(position.entry)}</strong></div>
+        <div><span>当前价</span><strong>${fmt(position.price)}</strong></div>
+        <div><span>持仓时长</span><strong>${esc(durationText(position))}</strong></div>
+        <div><span>信号</span><strong>${esc(position.signalId || position.signalType || "未绑定")}</strong></div>
+      </div>
+      ${position.halfProfitLabel ? `<div class="profit-lock">${esc(position.halfProfitLabel)}</div>` : ""}
+    </div>
+  `;
+}
+
 function renderTrades() {
   const data = state.data.trades;
   const tf = state.tradeFilters;
   const account = data.account || {};
+  const fakeoutStat = tradeTypeStat(data, "fakeout");
+  const breakoutStat = tradeTypeStat(data, "breakout");
   const tradeTypes = ["ALL", ...new Set(data.history.map((trade) => trade.type))];
   const filteredHistory = data.history
     .filter((trade) => (tf.direction === "ALL" || trade.direction === tf.direction)
@@ -788,17 +863,29 @@ function renderTrades() {
       ${metric("盈亏比", fmt(data.metrics.profitFactor), "Profit Factor")}
       ${metric("夏普", fmt(data.metrics.sharpe), `最大回撤 ${data.metrics.maxDrawdown}%`)}
 
-      <section class="panel span-5">
-        <h2>当前持仓</h2>
-        ${data.positions.length ? data.positions.map((position) => `
-          <div class="factor">
-            <div class="factor-top"><strong>${esc(position.symbol)}</strong><span class="${directionClass(position.direction)}">${esc(directionLabel(position.direction))}</span></div>
-            <div class="position-line"><span>浮动盈亏</span><strong class="${position.pnl >= 0 ? "positive" : "negative"}">${fmt(position.pnl, " USD")}</strong></div>
-            <div class="position-line"><span>入场 / 现价</span><strong>${fmt(position.entry)} / ${fmt(position.price)}</strong></div>
-            <div class="position-line"><span>止损价</span><strong class="negative">${fmt(position.stop)}</strong></div>
-            <div class="position-line"><span>关联信号</span><strong>${esc(position.signalId)}</strong></div>
+      <section class="panel span-12">
+        <div class="panel-head">
+          <h2>交易分组统计</h2>
+          <span class="status-pill ${data.okxStatus === "ok" ? "ok" : ""}">${data.okxStatus === "ok" ? "OKX持仓已校验" : "OKX持仓待校验"}</span>
+        </div>
+        <div class="trade-stat-row">
+          ${tradeStatCard(fakeoutStat)}
+          ${tradeStatCard(breakoutStat)}
+          <div class="trade-stat-card">
+            <span>全部已平仓</span>
+            <strong class="${data.metrics.totalPnl >= 0 ? "positive" : "negative"}">${fmt(data.metrics.totalPnl, " USD")}</strong>
+            <small>${data.history.length}笔 · 胜率 ${fmt(data.metrics.winRate, "%")}</small>
           </div>
-        `).join("") : `<div class="empty-state">当前没有真实持仓</div>`}
+        </div>
+      </section>
+
+      <section class="panel span-5">
+        <div class="panel-head">
+          <h2>实时持仓</h2>
+          <span class="status-pill">5秒自动刷新</span>
+        </div>
+        ${data.positions.length ? data.positions.map(renderPositionCard).join("") : `<div class="empty-state">当前没有真实持仓</div>`}
+        ${data.warnings?.length ? `<p class="warning small-note">${esc(data.warnings.join("；"))}</p>` : ""}
       </section>
 
       <section class="panel span-7">
@@ -807,7 +894,7 @@ function renderTrades() {
           <div class="chart-actions">
             <div class="chart-legend" aria-label="收益曲线图例">
               <span><i class="legend-dot legend-pnl"></i>PnL收益（日线）</span>
-              <span><i class="legend-dot legend-xau"></i>XAU日线</span>
+              <span><i class="legend-dot legend-xau"></i>回测预期</span>
             </div>
             <button id="exportTrades" class="ghost" type="button">导出 CSV</button>
           </div>
@@ -830,20 +917,18 @@ function renderTrades() {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>时间</th><th>等级</th><th>方向</th><th>类型</th><th>入场</th><th>出场</th><th>PnL</th><th>R</th></tr></thead>
+            <thead><tr><th>时间</th><th>信号</th><th>方向</th><th>入场 / 出场价</th><th>PnL</th><th>退出原因</th></tr></thead>
             <tbody>
               ${filteredHistory.length ? filteredHistory.map((trade) => `
                 <tr>
                   <td>${dateShort(trade.closedAt)}</td>
-                  <td>${gradeBadge(trade.signalGrade)}</td>
+                  <td>${gradeBadge(trade.signalGrade)} ${esc(typeLabel(trade.type))}</td>
                   <td class="${directionClass(trade.direction)}">${esc(directionLabel(trade.direction))}</td>
-                  <td>${esc(trade.type)}</td>
-                  <td>${fmt(trade.entry)}</td>
-                  <td>${fmt(trade.exit)}</td>
+                  <td>${fmt(trade.entry)} / ${fmt(trade.exit)}</td>
                   <td class="${trade.pnl >= 0 ? "positive" : "negative"}">${fmt(trade.pnl)}</td>
-                  <td>${trade.rMultiple}</td>
+                  <td>${esc(exitReasonLabel(trade.exitReason))}</td>
                 </tr>
-              `).join("") : `<tr><td colspan="8" class="neutral">暂无真实交易记录</td></tr>`}
+              `).join("") : `<tr><td colspan="6" class="neutral">暂无真实交易记录</td></tr>`}
             </tbody>
           </table>
         </div>
@@ -1268,6 +1353,39 @@ function render() {
   bindPageEvents();
   drawCharts();
   syncParticleBackground();
+  syncTradeRefresh();
+}
+
+async function refreshOpenTrades() {
+  if (tradeRefreshInFlight || state.page !== "trades") return;
+  tradeRefreshInFlight = true;
+  try {
+    const fresh = await api("/api/trades?status=open");
+    const current = state.data.trades || {};
+    state.data.trades = {
+      ...current,
+      ...fresh,
+      history: current.history || [],
+      attribution: fresh.attribution || current.attribution || [],
+      typeStats: fresh.typeStats || current.typeStats || []
+    };
+    render();
+  } catch (error) {
+    console.warn("trade refresh failed", error);
+  } finally {
+    tradeRefreshInFlight = false;
+  }
+}
+
+function syncTradeRefresh() {
+  if (state.page === "trades" && !tradeRefreshTimer) {
+    tradeRefreshTimer = setInterval(refreshOpenTrades, 5000);
+    return;
+  }
+  if (state.page !== "trades" && tradeRefreshTimer) {
+    clearInterval(tradeRefreshTimer);
+    tradeRefreshTimer = null;
+  }
 }
 
 function bindPageEvents() {
@@ -1359,7 +1477,8 @@ function drawCharts() {
     drawLine(canvas, series, { compact: true });
   });
   drawLine($("#macroScoreChart"), macro?.scoreHistory?.map((point) => point.v), { fill: true });
-  drawPnlComparison($("#pnlChart"), trades?.pnlCurve, trades?.goldCurve);
+  drawPnlComparison($("#pnlChart"), trades?.pnlCurve, trades?.expectedCurve || trades?.goldCurve);
+  drawPnlComparison($("#dashboardEquityChart"), trades?.pnlCurve, trades?.expectedCurve || trades?.goldCurve);
   const result = state.backtestResult || backtests?.lastRuns?.[0];
   drawLine($("#backtestEquityChart"), result?.equity?.map((point) => point.v), { fill: true });
   drawBars($("#monteCarloChart"), result?.monteCarlo?.slice(0, 80).map((point) => point.terminalReturn));

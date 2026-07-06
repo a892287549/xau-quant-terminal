@@ -726,6 +726,143 @@ h3 {
   background: rgba(12, 16, 22, 0.62);
 }
 
+.risk-card-row,
+.trade-stat-row {
+  display: grid;
+  gap: 10px;
+}
+
+.risk-card-row {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.trade-stat-row {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.risk-card,
+.trade-stat-card,
+.position-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(12, 16, 22, 0.64);
+}
+
+.risk-card {
+  display: grid;
+  gap: 6px;
+  min-height: 76px;
+  padding: 12px;
+}
+
+.risk-card span,
+.trade-stat-card span,
+.position-grid span,
+.small-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.risk-card strong,
+.trade-stat-card strong {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 18px;
+}
+
+.trade-stat-card {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+}
+
+.trade-stat-card small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.position-card {
+  position: relative;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+
+.position-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 4px;
+  border-radius: 0 4px 4px 0;
+  background: var(--green);
+  box-shadow: 0 0 14px rgba(0, 255, 136, 0.35);
+}
+
+.position-card.short::before {
+  background: var(--red);
+  box-shadow: 0 0 14px rgba(255, 51, 85, 0.35);
+}
+
+.position-card-head,
+.position-badges {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.position-card-head .label {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.position-badges {
+  justify-content: flex-end;
+}
+
+.position-value {
+  font: 850 26px "JetBrains Mono", "Fira Code", monospace;
+}
+
+.position-value span {
+  font-size: 13px;
+  color: currentColor;
+  opacity: 0.82;
+}
+
+.position-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.position-grid div {
+  display: grid;
+  gap: 4px;
+}
+
+.position-grid strong {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  color: var(--text);
+}
+
+.profit-lock {
+  padding: 9px 10px;
+  border: 1px solid rgba(255, 184, 0, 0.32);
+  border-radius: 6px;
+  background: rgba(255, 184, 0, 0.09);
+  color: var(--gold);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .factor-value {
   margin: 8px 0;
   font-size: 24px;
@@ -1530,6 +1667,12 @@ input[type="checkbox"] {
   }
 
   .metric-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .risk-card-row,
+  .trade-stat-row,
+  .position-grid {
     grid-template-columns: 1fr;
   }
 
