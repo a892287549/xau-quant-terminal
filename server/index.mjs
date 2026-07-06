@@ -14,6 +14,7 @@ import { OkxExecutor } from "./execution/okxExecutor.js";
 import { TradeDaemon } from "./daemon/tradeDaemon.js";
 import { FeishuNotifier } from "./notifications/feishuNotifier.js";
 import { WsHub } from "./realtime/wsHub.js";
+import { DataHealthMonitor } from "./monitor/dataHealth.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
@@ -33,6 +34,12 @@ const okxExecutor = new OkxExecutor();
 const macroFetcher = new MacroFetcher({ dataDir, storage });
 const feishuNotifier = new FeishuNotifier();
 const wsHub = new WsHub();
+const dataHealthMonitor = new DataHealthMonitor({
+  storage,
+  notifier: feishuNotifier,
+  getSettings: async () => runtimeSettings(await settingsStore.read()),
+  okxAdapter
+});
 const dataProvider = new LiveDataProvider({ oandaAdapter, okxAdapter, macroFetcher, storage });
 const tradeDaemon = new TradeDaemon({
   getSettings: async () => runtimeSettings(await settingsStore.read()),
@@ -41,7 +48,8 @@ const tradeDaemon = new TradeDaemon({
   macroFetcher,
   storage,
   notifier: feishuNotifier,
-  broadcaster: wsHub
+  broadcaster: wsHub,
+  dataHealthMonitor
 });
 
 const mimeTypes = {
@@ -122,6 +130,7 @@ async function handleApi(req, res, url) {
       },
       daemon: tradeDaemon.status(),
       websocket: wsHub.status(),
+      dataHealth: dataHealthMonitor.status(),
       dataSource: {
         mode: settings.api.dataMode,
         provider: settings.api.dataProvider,
@@ -283,6 +292,7 @@ if (process.argv.includes("--smoke")) {
   startMacroScheduler(macroFetcher, {
     enabled: async () => isRealDataMode(runtimeSettings(await settingsStore.read()))
   });
+  dataHealthMonitor.start();
   tradeDaemon.start();
   server.listen(port, "0.0.0.0", () => {
     console.log(`xau-quant-terminal listening on ${port}`);

@@ -118,6 +118,7 @@ export class OkxAdapter {
     this.timeoutMs = Number(options.timeoutMs || process.env.OKX_TIMEOUT_MS || 8000);
     this.maxRetries = Number(options.maxRetries || process.env.OKX_MAX_RETRIES || 2);
     this.rateLimiter = new RateLimiter(Number(options.limitPerSecond || process.env.OKX_RATE_LIMIT_PER_SECOND || 10));
+    this.lastRateLimit = null;
   }
 
   isConfigured() {
@@ -191,6 +192,7 @@ export class OkxAdapter {
       const text = await response.text();
       const payload = text ? JSON.parse(text) : {};
       const retryAfter = response.headers.get("retry-after");
+      this.captureRateLimit(response.headers);
       const retryAfterMs = retryAfter ? Number(retryAfter) * 1000 : 0;
       if (!response.ok) {
         throw new OkxHttpError(payload.msg || `OKX HTTP ${response.status}`, {
@@ -217,6 +219,19 @@ export class OkxAdapter {
       });
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  captureRateLimit(headers) {
+    const remaining = Number(headers.get("x-ratelimit-remaining") || headers.get("x-rate-limit-remaining"));
+    const limit = Number(headers.get("x-ratelimit-limit") || headers.get("x-rate-limit-limit"));
+    if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
+      this.lastRateLimit = {
+        remaining,
+        limit,
+        remainingPct: round((remaining / limit) * 100, 2),
+        updatedAt: new Date().toISOString()
+      };
     }
   }
 

@@ -242,7 +242,8 @@ export class TradeDaemon {
     macroFetcher,
     storage,
     notifier = null,
-    broadcaster = null
+    broadcaster = null,
+    dataHealthMonitor = null
   }) {
     this.getSettings = getSettings;
     this.okx = okxAdapter;
@@ -251,6 +252,7 @@ export class TradeDaemon {
     this.storage = storage;
     this.notifier = notifier;
     this.broadcaster = broadcaster;
+    this.dataHealthMonitor = dataHealthMonitor;
     this.timer = null;
     this.running = false;
     this.lastScan = null;
@@ -586,6 +588,15 @@ export class TradeDaemon {
         action: "skip_execution_guard",
         signalId: signal.id,
         reason: guard.reason,
+        executed: false
+      };
+    }
+    const executionHealth = await this.dataHealthMonitor?.checkBeforeTrade?.(settings);
+    if (executionHealth && executionHealth.ok === false) {
+      return {
+        action: "skip_okx_rate_limit",
+        signalId: signal.id,
+        reason: `${executionHealth.rate?.remainingPct}% remaining`,
         executed: false
       };
     }

@@ -504,6 +504,28 @@ export class Storage {
     };
   }
 
+  async getDataHealthSnapshot() {
+    if (!this.enabled) return null;
+    const candles = await this.db.query(
+      `SELECT MAX(time) AS latest
+       FROM candles
+       WHERE timeframe = 'H1' AND instrument LIKE 'XAU%'`
+    );
+    const macro = await this.db.query(
+      `SELECT key, MAX(observed_at) AS latest
+       FROM macro_data
+       WHERE key IN ('tips', 'cot')
+       GROUP BY key`
+    );
+    return {
+      candlesH1Latest: candles.rows[0]?.latest instanceof Date ? candles.rows[0].latest.toISOString() : candles.rows[0]?.latest || null,
+      macroLatest: Object.fromEntries(macro.rows.map((row) => [
+        row.key,
+        row.latest instanceof Date ? row.latest.toISOString() : row.latest
+      ]))
+    };
+  }
+
   async getTradeHistory(limit = 200) {
     if (!this.enabled) return [];
     const result = await this.db.query(
