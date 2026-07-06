@@ -43,6 +43,8 @@ let particleFrame = null;
 let particles = [];
 let tradeRefreshTimer = null;
 let tradeRefreshInFlight = false;
+let wsClient = null;
+let wsReconnectTimer = null;
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -127,6 +129,38 @@ async function loadData() {
   state.data = { health, dashboard, signals, macro, trades, backtests, settings };
   if (!state.selectedSignalId && signals.signals.length) state.selectedSignalId = signals.signals[0].id;
   updateChrome();
+}
+
+function connectRealtime() {
+  if (wsClient || wsReconnectTimer) return;
+  const protocol = location.protocol === "https:" ? "wss" : "ws";
+  const path = `${apiBase || ""}/ws`;
+  wsClient = new WebSocket(`${protocol}://${location.host}${path}`);
+  wsClient.onmessage = (event) => {
+    const message = JSON.parse(event.data || "{}");
+    if (message.type === "signal" && state.data.signals) {
+      state.data.signals.signals = message.data || [];
+      if (state.data.dashboard) state.data.dashboard.activeSignals = message.data || [];
+      if (["dashboard", "signals"].includes(state.page)) render();
+    }
+    if (message.type === "position" && state.data.trades) {
+      state.data.trades.positions = message.data || [];
+      if (state.data.dashboard) state.data.dashboard.positions = message.data || [];
+      if (["dashboard", "trades"].includes(state.page)) render();
+    }
+    if (message.type === "risk" && state.data.dashboard) {
+      state.data.dashboard.risk = message.data || state.data.dashboard.risk;
+      if (state.page === "dashboard") render();
+    }
+  };
+  wsClient.onclose = () => {
+    wsClient = null;
+    wsReconnectTimer = setTimeout(() => {
+      wsReconnectTimer = null;
+      connectRealtime();
+    }, 5000);
+  };
+  wsClient.onerror = () => wsClient?.close();
 }
 
 function updateChrome() {
@@ -1786,6 +1820,7 @@ async function boot() {
   try {
     await loadData();
     render();
+    connectRealtime();
   } catch (error) {
     $("#view").innerHTML = `<section class="panel"><h2>服务异常</h2><p class="negative">${esc(error.message)}</p></section>`;
   }

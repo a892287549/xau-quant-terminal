@@ -13,6 +13,7 @@ import { OkxAdapter } from "./data/okxAdapter.js";
 import { OkxExecutor } from "./execution/okxExecutor.js";
 import { TradeDaemon } from "./daemon/tradeDaemon.js";
 import { FeishuNotifier } from "./notifications/feishuNotifier.js";
+import { WsHub } from "./realtime/wsHub.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
@@ -31,6 +32,7 @@ const okxAdapter = new OkxAdapter();
 const okxExecutor = new OkxExecutor();
 const macroFetcher = new MacroFetcher({ dataDir, storage });
 const feishuNotifier = new FeishuNotifier();
+const wsHub = new WsHub();
 const dataProvider = new LiveDataProvider({ oandaAdapter, okxAdapter, macroFetcher, storage });
 const tradeDaemon = new TradeDaemon({
   getSettings: async () => runtimeSettings(await settingsStore.read()),
@@ -38,7 +40,8 @@ const tradeDaemon = new TradeDaemon({
   okxExecutor,
   macroFetcher,
   storage,
-  notifier: feishuNotifier
+  notifier: feishuNotifier,
+  broadcaster: wsHub
 });
 
 const mimeTypes = {
@@ -118,6 +121,7 @@ async function handleApi(req, res, url) {
         execution: okxExecutor.status(settings)
       },
       daemon: tradeDaemon.status(),
+      websocket: wsHub.status(),
       dataSource: {
         mode: settings.api.dataMode,
         provider: settings.api.dataProvider,
@@ -239,6 +243,19 @@ const server = http.createServer(async (req, res) => {
     await serveStatic(res, url.pathname);
   } catch (error) {
     json(res, { ok: false, error: error.message }, 500);
+  }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    if (url.pathname === "/ws" || url.pathname === "/quant/ws") {
+      wsHub.handleUpgrade(req, socket, head);
+      return;
+    }
+    socket.destroy();
+  } catch {
+    socket.destroy();
   }
 });
 

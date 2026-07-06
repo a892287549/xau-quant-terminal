@@ -241,7 +241,8 @@ export class TradeDaemon {
     okxExecutor,
     macroFetcher,
     storage,
-    notifier = null
+    notifier = null,
+    broadcaster = null
   }) {
     this.getSettings = getSettings;
     this.okx = okxAdapter;
@@ -249,6 +250,7 @@ export class TradeDaemon {
     this.macroFetcher = macroFetcher;
     this.storage = storage;
     this.notifier = notifier;
+    this.broadcaster = broadcaster;
     this.timer = null;
     this.running = false;
     this.lastScan = null;
@@ -371,11 +373,22 @@ export class TradeDaemon {
         risk,
         actions
       };
+      this.broadcast("signal", signals);
+      this.broadcast("position", openPositions);
+      this.broadcast("risk", risk);
       console.log(`[${this.lastScan}] 扫描完成，信号 ${signals.length} 个，执行 ${executed} 笔，持仓 ${openPositions.length} 个，mode=${autoExecute ? "execute" : "dry-run"}`);
       actions.slice(0, 8).forEach((action) => console.log(`[${this.lastScan}] daemon ${action.action}: ${action.reason || action.signalId || action.tradeId || ""}`));
       return this.lastResult;
     } finally {
       this.running = false;
+    }
+  }
+
+  broadcast(type, data) {
+    try {
+      this.broadcaster?.broadcast?.(type, data);
+    } catch (error) {
+      console.warn(`[${new Date().toISOString()}] websocket broadcast failed: ${error.message}`);
     }
   }
 
