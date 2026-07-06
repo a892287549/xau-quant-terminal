@@ -1189,6 +1189,15 @@ function renderSettings() {
       </section>
 
       <section class="panel span-6">
+        <h2>交易 Daemon</h2>
+        <div class="form-grid">
+          ${toggle("daemon.enabled", "启用自动扫描", settings.daemon?.enabled ?? true)}
+          ${toggle("daemon.autoExecute", "自动执行下单", settings.daemon?.autoExecute ?? false)}
+          <label>扫描间隔（分钟）<input name="daemon.scanIntervalMinutes" type="number" step="1" min="1" value="${settings.daemon?.scanIntervalMinutes ?? 5}"></label>
+        </div>
+      </section>
+
+      <section class="panel span-6">
         <h2>风险参数</h2>
         <div class="form-grid">
           <label>单笔基础风险 %<input name="risk.perTradeRiskPct" type="number" step="0.1" value="${settings.risk.perTradeRiskPct}"></label>

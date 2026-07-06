@@ -11,6 +11,7 @@ import { MacroFetcher, startMacroScheduler } from "./data/macroFetcher.js";
 import { OandaAdapter } from "./data/oandaAdapter.js";
 import { OkxAdapter } from "./data/okxAdapter.js";
 import { OkxExecutor } from "./execution/okxExecutor.js";
+import { TradeDaemon } from "./daemon/tradeDaemon.js";
 import { createDatabase } from "./db/postgres.js";
 import { Storage } from "./db/storage.js";
 import { SettingsStore } from "./settingsStore.mjs";
@@ -29,6 +30,13 @@ const okxAdapter = new OkxAdapter();
 const okxExecutor = new OkxExecutor();
 const macroFetcher = new MacroFetcher({ dataDir, storage });
 const dataProvider = new LiveDataProvider({ oandaAdapter, okxAdapter, macroFetcher, storage });
+const tradeDaemon = new TradeDaemon({
+  getSettings: async () => runtimeSettings(await settingsStore.read()),
+  okxAdapter,
+  okxExecutor,
+  macroFetcher,
+  storage
+});
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -106,6 +114,7 @@ async function handleApi(req, res, url) {
         mode: process.env.TRADING_ENABLED === "true" ? "live-enabled-by-env" : "disabled",
         execution: okxExecutor.status(settings)
       },
+      daemon: tradeDaemon.status(),
       dataSource: {
         mode: settings.api.dataMode,
         provider: settings.api.dataProvider,
@@ -253,6 +262,7 @@ if (process.argv.includes("--smoke")) {
   startMacroScheduler(macroFetcher, {
     enabled: async () => isRealDataMode(runtimeSettings(await settingsStore.read()))
   });
+  tradeDaemon.start();
   server.listen(port, "0.0.0.0", () => {
     console.log(`xau-quant-terminal listening on ${port}`);
   });

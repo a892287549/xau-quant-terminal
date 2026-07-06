@@ -311,6 +311,103 @@ export class Storage {
     return result.rows.map(openPositionFromTradeRow);
   }
 
+  async getTradeById(id) {
+    if (!this.enabled || !id) return null;
+    const result = await this.db.query(
+      `SELECT * FROM trades WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    return result.rows[0] ? tradeFromRow(result.rows[0]) : null;
+  }
+
+  async createOpenTrade({
+    id,
+    openedAt = new Date().toISOString(),
+    symbol = "XAU-USDT-SWAP",
+    direction,
+    type = "",
+    entry,
+    size,
+    stop = null,
+    signalGrade = "",
+    signalId = "",
+    payload = {}
+  } = {}) {
+    if (!this.enabled || !id) return false;
+    await this.db.query(
+      `INSERT INTO trades (
+        id, opened_at, symbol, direction, type, entry, size, signal_grade, status, payload
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9::jsonb)
+      ON CONFLICT (id) DO NOTHING`,
+      [
+        id,
+        openedAt,
+        symbol,
+        direction,
+        type,
+        entry,
+        size,
+        signalGrade,
+        JSON.stringify({
+          ...payload,
+          signalId,
+          signalGrade,
+          stop,
+          events: payload.events || []
+        })
+      ]
+    );
+    return true;
+  }
+
+  async updateTrade(id, patch = {}) {
+    if (!this.enabled || !id) return false;
+    const fields = [];
+    const values = [];
+    const allowed = {
+      closedAt: "closed_at",
+      exit: "exit",
+      size: "size",
+      pnl: "pnl",
+      rMultiple: "r_multiple",
+      status: "status",
+      payload: "payload"
+    };
+    for (const [key, column] of Object.entries(allowed)) {
+      if (!(key in patch)) continue;
+      values.push(key === "payload" ? JSON.stringify(patch[key] || {}) : patch[key]);
+      fields.push(`${column} = $${values.length}${key === "payload" ? "::jsonb" : ""}`);
+    }
+    if (!fields.length) return false;
+    values.push(id);
+    await this.db.query(
+      `UPDATE trades SET ${fields.join(", ")} WHERE id = $${values.length}`,
+      values
+    );
+    return true;
+  }
+
+  async appendTradeEvent(id, event = {}) {
+    if (!this.enabled || !id) return false;
+    const trade = await this.getTradeById(id);
+    if (!trade) return false;
+    const payload = trade.payload || {};
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    await this.updateTrade(id, {
+      payload: {
+        ...payload,
+        events: [
+          ...events,
+          {
+            at: new Date().toISOString(),
+            ...event
+          }
+        ]
+      }
+    });
+    return true;
+  }
+
   async getTradeHistory(limit = 200) {
     if (!this.enabled) return [];
     const result = await this.db.query(

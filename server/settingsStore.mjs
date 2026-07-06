@@ -16,6 +16,11 @@ export const defaultSettings = {
   paper: {
     initialBalanceUsdt: 10000
   },
+  daemon: {
+    enabled: true,
+    scanIntervalMinutes: 5,
+    autoExecute: false
+  },
   risk: {
     maxPositionPct: 12,
     perTradeRiskPct: 2,

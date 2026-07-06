@@ -1,0 +1,402 @@
+import { runSignalEngine } from "../engine/signalEngine.js";
+
+const EXECUTABLE_GRADES = new Set(["S", "A", "B"]);
+const HOUR_MS = 60 * 60 * 1000;
+
+function round(value, digits = 2) {
+  return Number(Number(value).toFixed(digits));
+}
+
+function compactId(prefix, value = Date.now()) {
+  return `${prefix}-${String(value).replace(/[^a-zA-Z0-9]/g, "").slice(-18)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function isExecutableSignal(signal) {
+  return EXECUTABLE_GRADES.has(signal?.grade)
+    && ["LONG", "SHORT"].includes(signal?.direction)
+    && Number.isFinite(Number(signal?.entry));
+}
+
+function sideForDirection(direction) {
+  return direction === "LONG" ? "buy" : "sell";
+}
+
+function closeSideForDirection(direction) {
+  return direction === "LONG" ? "sell" : "buy";
+}
+
+function directionSign(direction) {
+  return direction === "SHORT" ? -1 : 1;
+}
+
+function startOfUtcDay(value = new Date()) {
+  const date = new Date(value);
+  date.setUTCHours(0, 0, 0, 0);
+  return date;
+}
+
+function startOfUtcWeek(value = new Date()) {
+  const date = startOfUtcDay(value);
+  const day = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() - day + 1);
+  return date;
+}
+
+function isStopLossTrade(trade) {
+  const reason = String(trade.exitReason || trade.payload?.exitReason || "").toLowerCase();
+  return reason.includes("stop") || reason.includes("sl") || reason.includes("止损");
+}
+
+function avg(values = []) {
+  const rows = values.map(Number).filter((value) => Number.isFinite(value));
+  return rows.length ? rows.reduce((sum, value) => sum + value, 0) / rows.length : null;
+}
+
+function ma(candles = [], period = 10) {
+  const rows = candles.slice(-period);
+  return rows.length >= period ? avg(rows.map((candle) => candle.close)) : null;
+}
+
+function positionType(position) {
+  return position.type || position.payload?.signalType || "";
+}
+
+function hasPartialTakeProfit(position) {
+  return Boolean(position.payload?.partialTpAt || position.payload?.partialClosedAt || position.status === "partial_closed");
+}
+
+function maxHoldHours(position) {
+  const type = positionType(position);
+  if (type === "fakeout") return 12 * 4;
+  if (type === "breakout") return 24 * 4;
+  if (type === "range_revert") return 18 * 4;
+  if (type === "support_reversal") return 48;
+  return 72;
+}
+
+function weeklyLossPct(history = [], initialBalance = 10000) {
+  const week = startOfUtcWeek();
+  const pnl = history
+    .filter((trade) => trade.closedAt && new Date(trade.closedAt) >= week)
+    .reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+  return round(Math.max(0, -pnl) / Math.max(1, initialBalance) * 100);
+}
+
+function dailyStopCount(history = []) {
+  const today = startOfUtcDay();
+  return history.filter((trade) => trade.closedAt && new Date(trade.closedAt) >= today && isStopLossTrade(trade)).length;
+}
+
+function inEventWindow(settings = {}, now = new Date()) {
+  if (!settings?.risk?.eventCircuitBreaker) return false;
+  const windows = settings?.daemon?.eventWindows || [];
+  return windows.some((item) => {
+    const eventAt = new Date(item.at || item.time || item);
+    if (Number.isNaN(eventAt.getTime())) return false;
+    return Math.abs(eventAt.getTime() - now.getTime()) <= 30 * 60 * 1000;
+  });
+}
+
+function buildRiskSnapshot(settings = {}, history = []) {
+  const initialBalance = Number(settings?.paper?.initialBalanceUsdt || 10000);
+  const stoppedOutToday = dailyStopCount(history);
+  const weeklyDrawdownPct = weeklyLossPct(history, initialBalance);
+  const maxDailyStops = Number(settings?.risk?.maxDailyStops || 2);
+  const weeklyPausePct = Number(settings?.risk?.weeklyDrawdownPausePct || settings?.risk?.weeklyCircuitLossPct || 15);
+  const utcHour = new Date().getUTCHours();
+  const lockedHours = settings?.risk?.noTradeUtcHours || [0, 1, 2, 3, 4, 5, 6, 7];
+  const sessionLocked = lockedHours.includes(utcHour);
+  const eventLocked = inEventWindow(settings);
+  const reasons = [];
+  if (stoppedOutToday >= maxDailyStops) reasons.push(`daily_stops_${stoppedOutToday}/${maxDailyStops}`);
+  if (weeklyDrawdownPct >= weeklyPausePct) reasons.push(`weekly_drawdown_${weeklyDrawdownPct}%`);
+  if (sessionLocked) reasons.push(`utc_hour_locked_${utcHour}`);
+  if (eventLocked) reasons.push("event_window");
+  return {
+    canOpen: reasons.length === 0,
+    reasons,
+    stoppedOutToday,
+    maxDailyStops,
+    weeklyDrawdownPct,
+    weeklyPausePct,
+    sessionLocked,
+    eventLocked
+  };
+}
+
+function orderSizeFor(settings = {}) {
+  const raw = Number(settings?.daemon?.orderSize || process.env.OKX_DEFAULT_ORDER_SIZE || 0.01);
+  return Math.max(0.01, Math.floor(raw * 100) / 100).toFixed(2);
+}
+
+function candidateTradeId(signal) {
+  return `TRD-${signal.id || compactId("SIG")}`.slice(0, 64);
+}
+
+function shouldPartialTakeProfit(position, quote) {
+  if (positionType(position) !== "fakeout" || hasPartialTakeProfit(position)) return false;
+  const entry = Number(position.entry);
+  const stop = Number(position.stop || position.payload?.stop);
+  const current = Number(quote?.mid || position.price || entry);
+  if (!entry || !stop || !current) return false;
+  const r = Math.abs(entry - stop);
+  const move = (current - entry) * directionSign(position.direction);
+  return r > 0 && move >= r * 1.5;
+}
+
+function shouldTrailingClose(position, h4Candles = []) {
+  if (positionType(position) !== "fakeout" || !hasPartialTakeProfit(position)) return false;
+  const line = ma(h4Candles, 10);
+  const close = Number(h4Candles.at(-1)?.close);
+  if (!line || !close) return false;
+  return position.direction === "LONG" ? close < line : close > line;
+}
+
+function shouldTimeout(position) {
+  if (!position.openedAt) return false;
+  const heldHours = (Date.now() - new Date(position.openedAt).getTime()) / HOUR_MS;
+  return heldHours >= maxHoldHours(position);
+}
+
+export class TradeDaemon {
+  constructor({
+    getSettings,
+    okxAdapter,
+    okxExecutor,
+    macroFetcher,
+    storage
+  }) {
+    this.getSettings = getSettings;
+    this.okx = okxAdapter;
+    this.executor = okxExecutor;
+    this.macroFetcher = macroFetcher;
+    this.storage = storage;
+    this.timer = null;
+    this.running = false;
+    this.lastScan = null;
+    this.lastResult = null;
+  }
+
+  status() {
+    return {
+      running: Boolean(this.timer),
+      scanning: this.running,
+      lastScan: this.lastScan,
+      lastResult: this.lastResult
+    };
+  }
+
+  start() {
+    if (this.timer) return;
+    const boot = async () => {
+      const settings = await this.getSettings();
+      const daemon = settings?.daemon || {};
+      if (!daemon.enabled) {
+        console.log(`[${new Date().toISOString()}] trade daemon disabled`);
+        return;
+      }
+      const intervalMs = Math.max(1, Number(daemon.scanIntervalMinutes || 5)) * 60 * 1000;
+      this.timer = setInterval(() => this.scanOnce().catch((error) => this.logError(error)), intervalMs);
+      setTimeout(() => this.scanOnce().catch((error) => this.logError(error)), 2500);
+      console.log(`[${new Date().toISOString()}] trade daemon started interval=${intervalMs / 60000}m autoExecute=${Boolean(daemon.autoExecute)}`);
+    };
+    boot().catch((error) => this.logError(error));
+  }
+
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  logError(error) {
+    console.error(`[${new Date().toISOString()}] trade daemon error: ${error.message}`);
+  }
+
+  async fetchMarket() {
+    const [h1, h4, daily, macro, quote] = await Promise.all([
+      this.okx.getCandles({ timeframe: "H1", count: 300 }),
+      this.okx.getCandles({ timeframe: "H4", count: 240 }),
+      this.okx.getCandles({ timeframe: "D", count: 120 }),
+      this.macroFetcher.getSnapshot(),
+      this.okx.getPricing()
+    ]);
+    await Promise.allSettled([
+      this.storage?.persistCandles?.({ instrument: this.okx.instrument, timeframe: "H1", candles: h1, source: "okx" }),
+      this.storage?.persistCandles?.({ instrument: this.okx.instrument, timeframe: "H4", candles: h4, source: "okx" }),
+      this.storage?.persistCandles?.({ instrument: this.okx.instrument, timeframe: "D", candles: daily, source: "okx" })
+    ]);
+    return { h1, h4, daily, macro, quote };
+  }
+
+  async scanOnce() {
+    if (this.running) return this.lastResult;
+    this.running = true;
+    const startedAt = new Date().toISOString();
+    try {
+      const settings = await this.getSettings();
+      const daemon = settings?.daemon || {};
+      if (!daemon.enabled) {
+        this.lastResult = { skipped: true, reason: "daemon_disabled", startedAt };
+        return this.lastResult;
+      }
+      const autoExecute = Boolean(daemon.autoExecute);
+      const market = await this.fetchMarket();
+      const engine = runSignalEngine({
+        candles: market.h1,
+        macroSnapshot: market.macro,
+        settings
+      });
+      await this.storage?.persistSignals?.(engine.signals);
+      const signals = engine.signals.filter(isExecutableSignal);
+      const openPositions = await this.storage?.getOpenTradePositions?.(50) || [];
+      const history = await this.storage?.getTradeHistory?.(500) || [];
+      const risk = buildRiskSnapshot(settings, history);
+      const actions = [];
+      let executed = 0;
+
+      for (const position of openPositions) {
+        const action = await this.planPositionManagement({ position, market, autoExecute });
+        if (action) {
+          actions.push(action);
+          if (action.executed) executed += 1;
+        }
+      }
+
+      for (const signal of signals) {
+        const action = await this.planSignalExecution({
+          signal,
+          openPositions,
+          risk,
+          settings,
+          autoExecute
+        });
+        actions.push(action);
+        if (action.executed) executed += 1;
+      }
+
+      this.lastScan = new Date().toISOString();
+      this.lastResult = {
+        startedAt,
+        finishedAt: this.lastScan,
+        dryRun: !autoExecute,
+        signals: signals.length,
+        executed,
+        positions: openPositions.length,
+        risk,
+        actions
+      };
+      console.log(`[${this.lastScan}] 扫描完成，信号 ${signals.length} 个，执行 ${executed} 笔，持仓 ${openPositions.length} 个，mode=${autoExecute ? "execute" : "dry-run"}`);
+      actions.slice(0, 8).forEach((action) => console.log(`[${this.lastScan}] daemon ${action.action}: ${action.reason || action.signalId || action.tradeId || ""}`));
+      return this.lastResult;
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async planSignalExecution({ signal, openPositions, risk, settings, autoExecute }) {
+    const same = openPositions.find((position) => position.direction === signal.direction);
+    const opposite = openPositions.find((position) => position.direction !== signal.direction);
+    if (same) {
+      return {
+        action: "skip_same_direction",
+        signalId: signal.id,
+        reason: same.id,
+        executed: false
+      };
+    }
+    if (!risk.canOpen) {
+      return {
+        action: "skip_risk",
+        signalId: signal.id,
+        reason: risk.reasons.join(","),
+        executed: false
+      };
+    }
+    if (opposite && !autoExecute) {
+      return {
+        action: "would_close_reverse_then_open",
+        signalId: signal.id,
+        tradeId: opposite.id,
+        executed: false
+      };
+    }
+    if (!autoExecute) {
+      return {
+        action: "would_open",
+        signalId: signal.id,
+        direction: signal.direction,
+        grade: signal.grade,
+        type: signal.type,
+        entry: signal.entry,
+        stop: signal.stop,
+        size: orderSizeFor(settings),
+        executed: false
+      };
+    }
+
+    const guard = this.executor.guard(settings);
+    if (!guard.ok) {
+      return {
+        action: "skip_execution_guard",
+        signalId: signal.id,
+        reason: guard.reason,
+        executed: false
+      };
+    }
+    if (opposite) {
+      await this.executor.placePerpetualMarketOrder({
+        side: closeSideForDirection(opposite.direction),
+        size: opposite.size,
+        clientOrderId: compactId("rev")
+      }, settings);
+      await this.storage.appendTradeEvent(opposite.id, { type: "reverse_close_requested", signalId: signal.id });
+    }
+    const order = await this.executor.placePerpetualMarketOrder({
+      side: sideForDirection(signal.direction),
+      size: orderSizeFor(settings),
+      stopLossPrice: signal.stop,
+      clientOrderId: compactId("open")
+    }, settings);
+    const tradeId = candidateTradeId(signal);
+    await this.storage.createOpenTrade({
+      id: tradeId,
+      symbol: this.okx.instrument,
+      direction: signal.direction,
+      type: signal.type,
+      entry: signal.entry,
+      size: orderSizeFor(settings),
+      stop: signal.stop,
+      signalGrade: signal.grade,
+      signalId: signal.id,
+      payload: { signal, order }
+    });
+    return {
+      action: "opened",
+      signalId: signal.id,
+      tradeId,
+      executed: true
+    };
+  }
+
+  async planPositionManagement({ position, market, autoExecute }) {
+    if (shouldPartialTakeProfit(position, market.quote)) {
+      if (!autoExecute) {
+        return { action: "would_partial_tp", tradeId: position.id, reason: "fakeout_1.5R", executed: false };
+      }
+      return { action: "partial_tp_pending_p0_3", tradeId: position.id, executed: false };
+    }
+    if (shouldTrailingClose(position, market.h4)) {
+      if (!autoExecute) {
+        return { action: "would_trailing_close", tradeId: position.id, reason: "MA10_H4_cross", executed: false };
+      }
+      return { action: "trailing_close_pending_p0_3", tradeId: position.id, executed: false };
+    }
+    if (shouldTimeout(position)) {
+      if (!autoExecute) {
+        return { action: "would_timeout_close", tradeId: position.id, reason: "max_hold_reached", executed: false };
+      }
+      return { action: "timeout_close_pending_p0_3", tradeId: position.id, executed: false };
+    }
+    return null;
+  }
+}
