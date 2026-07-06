@@ -82,6 +82,22 @@ function weeklyLossPct(history = [], initialBalance = 10000) {
   return round(Math.max(0, -pnl) / Math.max(1, initialBalance) * 100);
 }
 
+function maxDrawdownPctFromTrades(history = [], initialBalance = 10000) {
+  let equity = initialBalance;
+  let peak = initialBalance;
+  let maxDrawdown = 0;
+  const rows = [...history]
+    .filter((trade) => trade.closedAt)
+    .sort((a, b) => new Date(a.closedAt) - new Date(b.closedAt));
+  for (const trade of rows) {
+    equity += Number(trade.pnl || 0);
+    peak = Math.max(peak, equity);
+    const drawdown = peak ? ((equity - peak) / peak) * 100 : 0;
+    maxDrawdown = Math.min(maxDrawdown, drawdown);
+  }
+  return round(maxDrawdown, 2);
+}
+
 function dailyStopCount(history = []) {
   const today = startOfUtcDay();
   return history.filter((trade) => trade.closedAt && new Date(trade.closedAt) >= today && isStopLossTrade(trade)).length;
@@ -127,6 +143,33 @@ function buildRiskSnapshot(settings = {}, history = []) {
 function orderSizeFor(settings = {}) {
   const raw = Number(settings?.daemon?.orderSize || process.env.OKX_DEFAULT_ORDER_SIZE || 0.01);
   return Math.max(0.01, Math.floor(raw * 100) / 100).toFixed(2);
+}
+
+function tradeTypeStats(history = []) {
+  const byType = new Map();
+  for (const trade of history) {
+    const type = trade.type || trade.payload?.signalType || "unknown";
+    const item = byType.get(type) || { type, count: 0, pnl: 0, wins: 0, winRate: 0 };
+    item.count += 1;
+    item.pnl += Number(trade.pnl || 0);
+    if (Number(trade.pnl || 0) > 0) item.wins += 1;
+    byType.set(type, item);
+  }
+  return Array.from(byType.values()).map((item) => ({
+    ...item,
+    pnl: round(item.pnl),
+    winRate: item.count ? round((item.wins / item.count) * 100) : 0
+  }));
+}
+
+function byTypeMap(rows = []) {
+  return new Map(rows.map((row) => [row.type, row]));
+}
+
+function deviationPct(expected, actual) {
+  const base = Math.abs(Number(expected || 0));
+  if (!base) return actual ? 100 : 0;
+  return round((Math.abs(Number(actual || 0) - Number(expected || 0)) / base) * 100, 2);
 }
 
 function candidateTradeId(signal) {
@@ -294,6 +337,7 @@ export class TradeDaemon {
 
       await this.notifyRiskIfNeeded(settings, risk);
       await this.maybeNotifyDailySummary(settings, history, openPositions);
+      await this.maybeGenerateAcceptanceReport(settings, history);
 
       for (const position of openPositions) {
         const action = await this.planPositionManagement({ position, market, settings, autoExecute });
@@ -388,6 +432,98 @@ export class TradeDaemon {
       positions: openPositions.length,
       weekPnl
     }));
+    await this.notifyDeviationIfNeeded(settings, history);
+  }
+
+  async notifyDeviationIfNeeded(settings, history = []) {
+    const benchmark = await this.storage?.getBacktestSignalBenchmark?.();
+    const expected = byTypeMap(benchmark?.byType || []);
+    const actual = byTypeMap(tradeTypeStats(history));
+    const expectedFakeout = expected.get("fakeout") || {};
+    const actualFakeout = actual.get("fakeout") || {};
+    const expectedBreakout = expected.get("breakout") || {};
+    const actualBreakout = actual.get("breakout") || {};
+    const expectedTotalPnl = (benchmark?.byType || []).reduce((sum, row) => sum + Number(row.pnl || 0), 0);
+    const actualTotalPnl = history.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+    const deviations = [
+      {
+        label: "fakeout胜率",
+        expected: round(expectedFakeout.winRate || 0),
+        actual: round(actualFakeout.winRate || 0),
+        deviationPct: deviationPct(expectedFakeout.winRate || 0, actualFakeout.winRate || 0),
+        threshold: 30
+      },
+      {
+        label: "breakout PnL",
+        expected: round(expectedBreakout.pnl || 0),
+        actual: round(actualBreakout.pnl || 0),
+        deviationPct: deviationPct(expectedBreakout.pnl || 0, actualBreakout.pnl || 0),
+        threshold: 30
+      },
+      {
+        label: "总PnL",
+        expected: round(expectedTotalPnl),
+        actual: round(actualTotalPnl),
+        deviationPct: deviationPct(expectedTotalPnl, actualTotalPnl),
+        threshold: 20
+      }
+    ].filter((item) => item.deviationPct > item.threshold);
+    if (deviations.length) {
+      await this.safeNotify(() => this.notifier.notifyDeviationAlert(settings, deviations));
+    }
+  }
+
+  async maybeGenerateAcceptanceReport(settings, history = []) {
+    if (!this.storage?.enabled) return null;
+    const key = "paper_observation";
+    const existing = await this.storage.readConfig(key) || {};
+    const startedAt = existing.startedAt || new Date().toISOString();
+    if (!existing.startedAt) await this.storage.writeConfig(key, { ...existing, startedAt });
+    if (existing.reportGeneratedAt) return existing.report;
+    const elapsedMs = Date.now() - new Date(startedAt).getTime();
+    if (elapsedMs < 14 * 24 * HOUR_MS) return null;
+    const benchmark = await this.storage.getBacktestSignalBenchmark();
+    const latestRun = (await this.storage.getBacktestRuns(1))[0] || {};
+    const expected = byTypeMap(benchmark.byType || []);
+    const actual = byTypeMap(tradeTypeStats(history));
+    const expectedTotalPnl = (benchmark.byType || []).reduce((sum, row) => sum + Number(row.pnl || 0), 0);
+    const actualTotalPnl = history.reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+    const expectedTrades = (benchmark.byType || []).reduce((sum, row) => sum + Number(row.count || 0), 0);
+    const actualDrawdown = maxDrawdownPctFromTrades(history, Number(settings?.paper?.initialBalanceUsdt || 10000));
+    const expectedDrawdown = Number(latestRun.metrics?.maxDrawdown || 0);
+    const rows = [
+      this.reportRow("总PnL", expectedTotalPnl, actualTotalPnl, 20),
+      this.reportRow("fakeout胜率", expected.get("fakeout")?.winRate || 0, actual.get("fakeout")?.winRate || 0, 30),
+      this.reportRow("breakoutPnL", expected.get("breakout")?.pnl || 0, actual.get("breakout")?.pnl || 0, 30),
+      this.reportRow("交易数", expectedTrades, history.length, 25),
+      this.reportRow("最大回撤", Math.abs(expectedDrawdown), Math.abs(actualDrawdown), 30)
+    ];
+    const report = {
+      startedAt,
+      generatedAt: new Date().toISOString(),
+      benchmarkRunId: benchmark.runId,
+      rows,
+      allPassed: rows.every((row) => row.pass)
+    };
+    await this.storage.writeConfig(key, {
+      ...existing,
+      startedAt,
+      reportGeneratedAt: report.generatedAt,
+      report
+    });
+    await this.safeNotify(() => this.notifier.notifyAcceptanceReport(settings, report));
+    return report;
+  }
+
+  reportRow(metric, backtest, actual, threshold) {
+    const deviation = deviationPct(backtest, actual);
+    return {
+      metric,
+      backtest: round(backtest),
+      actual: round(actual),
+      deviationPct: deviation,
+      pass: deviation <= threshold
+    };
   }
 
   async planSignalExecution({ signal, openPositions, risk, settings, autoExecute }) {

@@ -117,4 +117,22 @@ export class FeishuNotifier {
       "XAU 每日汇总"
     );
   }
+
+  notifyDeviationAlert(settings, deviations = []) {
+    const lines = deviations.map((item) => `- ${item.label}: 回测 ${item.expected} / 实际 ${item.actual} / 偏差 ${item.deviationPct}%`);
+    return this.send(
+      settings,
+      `🚨 **纸盘偏差超阈值**\n\n${lines.join("\n")}`,
+      "XAU 偏差告警"
+    );
+  }
+
+  notifyAcceptanceReport(settings, report) {
+    const lines = report.rows.map((row) => `| ${row.metric} | ${row.backtest} | ${row.actual} | ${row.deviationPct}% | ${row.pass ? "通过" : "不通过"} |`);
+    return this.send(
+      settings,
+      `**2周纸盘验收报告**\n\n| 指标 | 回测 | 实际 | 偏差 | 通过 |\n| --- | --- | --- | --- | --- |\n${lines.join("\n")}\n\n${report.allPassed ? "✅ 建议上微量实盘" : "⚠️ 需人工判断"}`,
+      "XAU 纸盘验收"
+    );
+  }
 }

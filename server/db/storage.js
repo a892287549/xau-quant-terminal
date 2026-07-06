@@ -462,6 +462,48 @@ export class Storage {
     return result.rows.map(executionAuditFromRow);
   }
 
+  async getBacktestSignalBenchmark() {
+    if (!this.enabled) return { runId: "", byType: [] };
+    const run = await this.db.query(
+      `SELECT id FROM backtest_runs ORDER BY created_at DESC LIMIT 1`
+    );
+    const runId = run.rows[0]?.id || "";
+    if (!runId) return { runId: "", byType: [] };
+    const result = await this.db.query(
+      `WITH typed AS (
+        SELECT
+          CASE
+            WHEN signal_id LIKE '%-fakeout-%' THEN 'fakeout'
+            WHEN signal_id LIKE '%-breakout-%' THEN 'breakout'
+            WHEN signal_id LIKE '%-support_reversal-%' THEN 'support_reversal'
+            WHEN signal_id LIKE '%-structural_breakdown-%' THEN 'structural_breakdown'
+            ELSE COALESCE(payload->>'type', 'unknown')
+          END AS type,
+          pnl
+        FROM backtest_trades
+        WHERE run_id = $1
+      )
+      SELECT
+        type,
+        COUNT(*)::int AS count,
+        COALESCE(SUM(pnl), 0) AS pnl,
+        COALESCE(AVG(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) * 100, 0) AS win_rate
+      FROM typed
+      GROUP BY type
+      ORDER BY count DESC`,
+      [runId]
+    );
+    return {
+      runId,
+      byType: result.rows.map((row) => ({
+        type: row.type,
+        count: Number(row.count || 0),
+        pnl: num(row.pnl) || 0,
+        winRate: num(row.win_rate) || 0
+      }))
+    };
+  }
+
   async getTradeHistory(limit = 200) {
     if (!this.enabled) return [];
     const result = await this.db.query(
