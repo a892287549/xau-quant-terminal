@@ -315,7 +315,7 @@ export class OkxAdapter {
       .filter((position) => position.size > 0);
   }
 
-  async placeOrder({ instrument = this.instrument, side, size, orderType = "market", price, clientOrderId, tradeMode = "cross" } = {}) {
+  async placeOrder({ instrument = this.instrument, side, size, orderType = "market", price, clientOrderId } = {}) {
     if (!this.isTradingEnabled()) {
       throw new OkxHttpError("OKX trading is disabled or credentials are missing", { status: 0 });
     }
@@ -324,7 +324,7 @@ export class OkxAdapter {
     }
     const body = {
       instId: instrument,
-      tdMode: tradeMode,
+      tdMode: "isolated",
       side,
       ordType: orderType,
       sz: String(size)

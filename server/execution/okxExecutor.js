@@ -17,6 +17,10 @@ function normalizeMode(value) {
   return value === "live" || value === "real" ? "live" : "demo";
 }
 
+function normalizeMarginMode(value) {
+  return "isolated";
+}
+
 function compactId(prefix) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.slice(0, 32);
 }
@@ -132,6 +136,10 @@ export class OkxExecutor {
     return normalizeMode(settings?.api?.tradeMode || process.env.OKX_TRADING_MODE || "demo");
   }
 
+  marginMode(settings = {}, fallback = "") {
+    return normalizeMarginMode(fallback || settings?.api?.marginMode || process.env.OKX_MARGIN_MODE || "isolated");
+  }
+
   apiBaseFor(settings = {}) {
     return this.tradingMode(settings) === "demo" ? this.demoApiBase : this.liveApiBase;
   }
@@ -144,6 +152,7 @@ export class OkxExecutor {
     return {
       provider: "okx",
       mode,
+      marginMode: this.marginMode(settings),
       instrument: this.instrument,
       configured: this.isConfigured(),
       demoTradingEnabled: bool(process.env.OKX_DEMO_TRADING_ENABLED),
@@ -264,11 +273,11 @@ export class OkxExecutor {
     size,
     stopLossPrice,
     takeProfitPrice,
-    tdMode = "cross",
+    tdMode = "",
     clientOrderId,
     reduceOnly = false,
     posSide = ""
-  } = {}) {
+  } = {}, settings = {}) {
     if (!["buy", "sell"].includes(side)) {
       throw new OkxExecutionError("OKX order side must be buy or sell", { reason: "invalid_side" });
     }
@@ -278,7 +287,7 @@ export class OkxExecutor {
     const clOrdId = clientOrderId || compactId("xau");
     const body = {
       instId: instrument,
-      tdMode,
+      tdMode: this.marginMode(settings, tdMode),
       side,
       ordType: "market",
       sz: String(size),
@@ -359,7 +368,7 @@ export class OkxExecutor {
         reason: guard.reason
       });
     }
-    const body = this.buildPerpetualMarketOrder(input);
+    const body = this.buildPerpetualMarketOrder(input, settings);
     const payload = await this.request("/api/v5/trade/order", {
       method: "POST",
       body,
@@ -395,7 +404,7 @@ export class OkxExecutor {
     side,
     size,
     price,
-    tdMode = "cross",
+    tdMode = "",
     clientOrderId
   } = {}, settings = {}) {
     const guard = this.guard(settings);
@@ -415,7 +424,7 @@ export class OkxExecutor {
     }
     const body = {
       instId: instrument,
-      tdMode,
+      tdMode: this.marginMode(settings, tdMode),
       side,
       ordType: "limit",
       px: String(roundedPrice),
@@ -620,7 +629,7 @@ export class OkxExecutor {
   async placeStopAlgo({ instrument = this.instrument, direction, size, stopPrice, settings = {} } = {}) {
     const body = {
       instId: instrument,
-      tdMode: "cross",
+      tdMode: this.marginMode(settings),
       side: closeSide(direction),
       ordType: "conditional",
       sz: String(roundLot(size)),

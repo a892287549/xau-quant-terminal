@@ -196,7 +196,7 @@ async function handleApi(req, res, url) {
         stopLossPrice,
         takeProfitPrice,
         clientOrderId: input.clientOrderId || input.clOrdId,
-        tdMode: input.tdMode || input.tradeMode || "cross"
+        tdMode: "isolated"
       }, settings);
       return json(res, { ok: true, order });
     } catch (error) {

@@ -40,6 +40,10 @@ function isPaperExecution(settings = {}) {
   return settings?.api?.tradeMode !== "live";
 }
 
+function marginMode(settings = {}, fallback = "") {
+  return "isolated";
+}
+
 function quotePrice(market = {}, fallback = null) {
   const value = Number(market.quote?.mid || market.quote?.last || fallback);
   return Number.isFinite(value) ? value : null;
@@ -395,7 +399,8 @@ function paperOrder({
   state = "filled",
   reason = "paper",
   fee = 0,
-  execution = null
+  execution = null,
+  tdMode = "isolated"
 } = {}) {
   const clOrdId = clientOrderId || compactId("paper");
   const ordId = compactId("paperord");
@@ -407,6 +412,7 @@ function paperOrder({
     request: {
       side,
       size: String(size),
+      tdMode,
       ordType: orderType,
       px: Number.isFinite(fillPx) ? fillPx : null,
       stopLossPrice: stop,
@@ -845,7 +851,8 @@ export class TradeDaemon {
       clientOrderId: compactId("pcls"),
       reason,
       fee: closeFee,
-      execution
+      execution,
+      tdMode: marginMode(settings)
     });
     const closePnl = paperClosePnl(trade, fill, size, settings, { closeFee, entryFee });
     const payload = trade.payload || {};
@@ -930,7 +937,8 @@ export class TradeDaemon {
       clientOrderId: compactId("pptp"),
       reason: "partial_take_profit",
       fee: closeFee,
-      execution
+      execution,
+      tdMode: marginMode(settings)
     });
     await this.storage.updateTrade(positionId, {
       size: remainingSize,
@@ -983,7 +991,8 @@ export class TradeDaemon {
         clientOrderId: compactId("ptgt"),
         orderType: "limit",
         state: "live",
-        reason: target.reason
+        reason: target.reason,
+        tdMode: marginMode(settings)
       });
       return {
         ...target,
@@ -1159,7 +1168,8 @@ export class TradeDaemon {
           clientOrderId: compactId("open"),
           reason: "open",
           fee: openFee,
-          execution: paperExecutionDetails
+          execution: paperExecutionDetails,
+          tdMode: marginMode(settings)
         })
         : await this.executor.placePerpetualMarketOrder({
           side: openSide,

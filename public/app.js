@@ -1295,6 +1295,9 @@ function renderSettings() {
           <label>交易模式<select name="api.tradeMode">
             ${[["paper", "纸盘（本地）"], ["live", "实盘"]].map(([value, label]) => `<option value="${value}" ${settings.api.tradeMode === value ? "selected" : ""}>${label}</option>`).join("")}
           </select></label>
+          <label>保证金模式<select name="api.marginMode">
+            <option value="isolated" selected>逐仓</option>
+          </select></label>
           ${toggle("api.oandaTokenConfigured", "OANDA Key 已放入服务器", settings.api.oandaTokenConfigured)}
           ${toggle("api.okxTradingConfigured", "OKX 交易 Key 已放入服务器", settings.api.okxTradingConfigured)}
           <label>模拟账户初始余额 USDT<input name="paper.initialBalanceUsdt" type="number" step="1" min="0" value="${settings.paper?.initialBalanceUsdt ?? 10000}"></label>
