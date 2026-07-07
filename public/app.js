@@ -873,6 +873,7 @@ function tradeStatCard(stat) {
 function renderPositionCard(position) {
   const pnlClass = Number(position.pnl || 0) >= 0 ? "positive" : "negative";
   const verifyClass = position.okxVerified === true ? "ok" : "";
+  const leverage = Number(position.marginLeverage || state.data.trades?.account?.marginLeverage || 1);
   return `
     <div class="position-card ${position.direction === "SHORT" ? "short" : "long"}">
       <div class="position-card-head">
@@ -889,8 +890,12 @@ function renderPositionCard(position) {
         ${fmt(position.pnl, " USD")} <span>${fmt(position.pnlPct, "%")}</span>
       </div>
       <div class="position-grid">
+        <div><span>仓位</span><strong>${fmt(position.size, " 手")}</strong></div>
+        <div><span>杠杆</span><strong>${fmt(leverage, "x")}</strong></div>
         <div><span>入场价</span><strong>${fmt(position.entry)}</strong></div>
         <div><span>当前价</span><strong>${fmt(position.price)}</strong></div>
+        <div><span>名义价值</span><strong>${fmt(position.notional, " USDT")}</strong></div>
+        <div><span>占用保证金</span><strong>${fmt(position.usedMargin, " USDT")}</strong></div>
         <div><span>持仓时长</span><strong>${esc(durationText(position))}</strong></div>
         <div><span>信号</span><strong>${esc(position.signalId || position.signalType || "未绑定")}</strong></div>
       </div>

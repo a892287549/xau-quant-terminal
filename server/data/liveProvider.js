@@ -76,10 +76,22 @@ function positionMargin(position = {}, settings = {}) {
   return positionNotional(position, settings) / paperMarginLeverage(settings);
 }
 
+function enrichPositionSizing(position = {}, settings = {}) {
+  const leverage = paperMarginLeverage(settings);
+  const notional = positionNotional(position, settings);
+  return {
+    ...position,
+    marginLeverage: leverage,
+    notional: round(notional),
+    usedMargin: round(notional / leverage),
+    contractMultiplier: pnlMultiplier(settings)
+  };
+}
+
 function withQuotePosition(position, quote, settings = {}) {
   if (!position || !quote) return position;
   const price = closeablePrice(position.direction, quote, position.price || position.entry, settings);
-  if (!Number.isFinite(price)) return position;
+  if (!Number.isFinite(price)) return enrichPositionSizing(position, settings);
   const sign = position.direction === "SHORT" ? -1 : 1;
   const payload = position.payload || {};
   const grossPnl = (price - position.entry) * sign * position.size * pnlMultiplier(settings);
@@ -91,7 +103,11 @@ function withQuotePosition(position, quote, settings = {}) {
     ...position,
     price: round(price),
     pnl: round(pnl),
-    pnlPct: round(notional ? (pnl / notional) * 100 : ((price - position.entry) / position.entry) * 100 * sign)
+    pnlPct: round(notional ? (pnl / notional) * 100 : ((price - position.entry) / position.entry) * 100 * sign),
+    marginLeverage: paperMarginLeverage(settings),
+    notional: round(notional),
+    usedMargin: round(positionMargin(position, settings)),
+    contractMultiplier: pnlMultiplier(settings)
   };
 }
 
