@@ -731,7 +731,7 @@ export async function runBacktest({ storage, macroSnapshot, settings, input = {}
     rangeLowerThreshold: numberParam(input.rangeLowerThreshold, settings?.strategy?.rangeLowerThreshold ?? 0.15),
     requirePinBar: boolParam(input.requirePinBar, settings?.strategy?.requirePinBar ?? true),
     fakeoutVolumeFilter: boolParam(input.fakeoutVolumeFilter, settings?.strategy?.fakeoutVolumeFilter ?? false),
-    flowResonanceMode: input.flowResonanceMode === "relaxed" ? "relaxed" : "strict",
+    flowResonanceMode: (input.flowResonanceMode || settings?.strategy?.flowResonanceMode) === "relaxed" ? "relaxed" : "strict",
     newExitRules: boolParam(input.newExitRules, exitRules.newExitRules ?? false),
     sizingMode: input.sizingMode || "legacy",
     pnlMultiplier: numberParam(input.pnlMultiplier, 100),
